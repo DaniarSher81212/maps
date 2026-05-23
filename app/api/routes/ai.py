@@ -18,12 +18,11 @@ app/api/routes/ai.py — FastAPI-маршруты для AI-анализа де�
     Кроме того, POST не кэшируется браузером — каждый запрос свежий.
 """
 
-import os
-
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 
 from app.ai.deficit_analyzer import explain_deficit, list_deficit_materials
+from app.core.config import settings
 from app.db.database import get_session
 
 router = APIRouter()
@@ -101,7 +100,7 @@ def explain_deficit_endpoint(body: ExplainRequest) -> ExplainResponse:
         - context_snapshot: данные которые видел Claude (для проверки)
         - статистику: дефицит, потребность, покрытие, число работ
     """
-    api_key = os.environ.get("ANTHROPIC_API_KEY")
+    api_key = settings.anthropic_api_key
     if not api_key:
         raise HTTPException(
             status_code=503,

@@ -52,6 +52,11 @@ class Settings(BaseSettings):
     data_dir: str = Field(default="data", description="Папка с Excel-файлами")
     export_dir: str = Field(default="data/exports", description="Папка для экспорта результатов")
 
+    # --- AI-анализ ---
+    # Ключ Anthropic API для функции объяснения дефицита.
+    # None если не задан — AI-анализ просто недоступен, остальное работает.
+    anthropic_api_key: str | None = Field(default=None, description="Anthropic API key")
+
     # --- Вычисляемые поля ---
     # @computed_field — это поле вычисляется автоматически из других полей,
     # его НЕ нужно задавать в .env
