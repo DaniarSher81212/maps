@@ -36,6 +36,10 @@
 
         /* Прогресс загрузки файла */
         .upload-result { font-size: 0.85rem; margin-top: 0.4rem; }
+
+        /* AI-анализ */
+        .ai-card { border: none; border-radius: 12px; box-shadow: 0 2px 8px rgba(0,0,0,.08); }
+        .ai-explanation { white-space: pre-wrap; line-height: 1.8; font-size: 0.95rem; }
     </style>
 </head>
 <body>
@@ -275,6 +279,55 @@
         </div>
 
     </div><!-- /row -->
+
+    <!-- ======================= AI-АНАЛИЗ ДЕФИЦИТА ======================== -->
+    <div class="ai-card card p-4 mt-2 mb-4">
+        <h5 class="fw-bold mb-1">
+            <i class="bi bi-robot me-2 text-primary"></i>AI-анализ дефицита
+        </h5>
+        <p class="text-muted small mb-3">
+            Выберите сессию и материал — Claude объяснит причину дефицита и даст рекомендацию.
+        </p>
+
+        <div class="row g-3 align-items-end">
+            <div class="col-md-4">
+                <label class="form-label small text-muted fw-semibold mb-1">Сессия распределения</label>
+                <select class="form-select" id="ai-session" onchange="loadDeficitMaterials()">
+                    <option value="">— выберите сессию —</option>
+                </select>
+            </div>
+            <div class="col-md-5">
+                <label class="form-label small text-muted fw-semibold mb-1">Материал с дефицитом</label>
+                <select class="form-select" id="ai-material" disabled onchange="document.getElementById('btn-explain').disabled = !this.value">
+                    <option value="">— сначала выберите сессию —</option>
+                </select>
+            </div>
+            <div class="col-md-3">
+                <button class="btn btn-primary w-100" onclick="explainDeficit()" id="btn-explain" disabled>
+                    <i class="bi bi-stars me-1"></i>Объяснить
+                </button>
+            </div>
+        </div>
+
+        <!-- Индикатор загрузки -->
+        <div id="ai-loading" class="mt-4 d-none text-center py-3 text-muted">
+            <div class="spinner-border spinner-border-sm text-primary me-2"></div>
+            Claude анализирует данные… (5–15 секунд)
+        </div>
+
+        <!-- Ошибка -->
+        <div id="ai-error" class="alert alert-danger mt-3 d-none"></div>
+
+        <!-- Результат -->
+        <div id="ai-result" class="mt-4 d-none">
+            <hr class="my-3">
+            <!-- Мини-статистика -->
+            <div id="ai-stats" class="d-flex flex-wrap gap-3 mb-3 small"></div>
+            <!-- Текст от Claude -->
+            <div class="bg-light rounded-3 p-3 ai-explanation" id="ai-explanation"></div>
+        </div>
+    </div>
+
 </div><!-- /container -->
 
 <div class="mt-5 py-3 text-center text-muted small border-top">
@@ -377,6 +430,9 @@ async function loadSessions() {
             </tr>`;
         }).join("");
 
+        // Заполняем дропдаун сессий для AI-анализа
+        populateAiSessions(sessions);
+
         // Если есть сессия со статусом 'running' — опрашиваем каждые 3 сек
         const hasRunning = sessions.some(s => s.status === "running");
         if (hasRunning) {
@@ -462,6 +518,119 @@ async function uploadFile(input, endpoint, resultId) {
 
     // Сбросить input чтобы можно было загрузить тот же файл повторно
     input.value = "";
+}
+
+// ============================================================================
+// AI-анализ дефицита
+// ============================================================================
+
+// Заполняем дропдаун сессий (только завершённые с дефицитом)
+function populateAiSessions(sessions) {
+    const sel = document.getElementById("ai-session");
+    const current = sel.value;  // Сохраняем текущий выбор при перезагрузке
+
+    const withDeficit = sessions.filter(s => s.status === "completed" && s.total_deficit > 0);
+
+    sel.innerHTML = '<option value="">— выберите сессию —</option>';
+    withDeficit.forEach(s => {
+        const dt = s.started_at
+            ? new Date(s.started_at).toLocaleString("ru-RU", {
+                day: "2-digit", month: "2-digit", hour: "2-digit", minute: "2-digit"
+              })
+            : s.id;
+        const opt = document.createElement("option");
+        opt.value = s.id;
+        opt.textContent = `${dt} — дефицит ${s.total_deficit}`;
+        if (s.id === current) opt.selected = true;
+        sel.appendChild(opt);
+    });
+}
+
+// Загружаем список материалов с дефицитом для выбранной сессии
+async function loadDeficitMaterials() {
+    const sessionId = document.getElementById("ai-session").value;
+    const matSel = document.getElementById("ai-material");
+    const btnExplain = document.getElementById("btn-explain");
+
+    // Сбрасываем результат при смене сессии
+    document.getElementById("ai-result").classList.add("d-none");
+    document.getElementById("ai-error").classList.add("d-none");
+
+    if (!sessionId) {
+        matSel.disabled = true;
+        matSel.innerHTML = '<option value="">— сначала выберите сессию —</option>';
+        btnExplain.disabled = true;
+        return;
+    }
+
+    matSel.disabled = true;
+    matSel.innerHTML = '<option value="">Загрузка списка материалов…</option>';
+    btnExplain.disabled = true;
+
+    try {
+        const r = await fetch(`/api/ai/deficits/${sessionId}`);
+        if (!r.ok) throw new Error("Дефицита нет");
+        const materials = await r.json();
+
+        matSel.innerHTML = '<option value="">— выберите материал —</option>';
+        materials.forEach(m => {
+            const unit = m.ed_izm || "ед.";
+            const opt = document.createElement("option");
+            opt.value = m.material_id;
+            opt.textContent = `${m.name} — ${m.total_deficit} ${unit} (${m.works_count} раб.)`;
+            matSel.appendChild(opt);
+        });
+        matSel.disabled = false;
+
+    } catch(e) {
+        matSel.innerHTML = '<option value="">Дефицита нет в этой сессии</option>';
+        matSel.disabled = true;
+    }
+}
+
+// Запрос AI-объяснения
+async function explainDeficit() {
+    const sessionId  = document.getElementById("ai-session").value;
+    const materialId = document.getElementById("ai-material").value;
+    if (!sessionId || !materialId) return;
+
+    // Сброс UI
+    document.getElementById("ai-result").classList.add("d-none");
+    document.getElementById("ai-error").classList.add("d-none");
+    document.getElementById("ai-loading").classList.remove("d-none");
+    document.getElementById("btn-explain").disabled = true;
+
+    try {
+        const r = await fetch("/api/ai/explain", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ session_id: sessionId, material_id: parseInt(materialId) }),
+        });
+        const d = await r.json();
+
+        if (!r.ok) throw new Error(d.detail || "Ошибка AI-анализа");
+
+        // Мини-статистика над объяснением
+        document.getElementById("ai-stats").innerHTML = `
+            <span class="badge bg-primary">${d.material_name}</span>
+            <span class="text-muted">нужно: <b class="text-dark">${d.total_needed}</b></span>
+            <span class="text-muted">покрыто: <b class="text-dark">${d.total_allocated}</b></span>
+            <span class="text-danger">дефицит: <b>${d.total_deficit}</b></span>
+            <span class="text-muted">${d.works_count} работ</span>
+        `;
+
+        // Текст от Claude
+        document.getElementById("ai-explanation").textContent = d.explanation;
+        document.getElementById("ai-result").classList.remove("d-none");
+
+    } catch(e) {
+        const errEl = document.getElementById("ai-error");
+        errEl.textContent = "Ошибка: " + e.message;
+        errEl.classList.remove("d-none");
+    } finally {
+        document.getElementById("ai-loading").classList.add("d-none");
+        document.getElementById("btn-explain").disabled = false;
+    }
 }
 
 // ============================================================================

@@ -32,7 +32,7 @@ from fastapi import FastAPI, Request
 from fastapi.responses import HTMLResponse
 from fastapi.templating import Jinja2Templates
 
-from app.api.routes import allocation, export, import_, status
+from app.api.routes import ai, allocation, export, import_, status
 
 # Путь к папке с HTML-шаблонами (рядом с этим файлом)
 BASE_DIR = Path(__file__).parent
@@ -58,6 +58,7 @@ app.include_router(status.router, prefix="/api", tags=["Статус"])
 app.include_router(allocation.router, prefix="/api", tags=["Распределение"])
 app.include_router(import_.router, prefix="/api", tags=["Импорт"])
 app.include_router(export.router, prefix="/api", tags=["Экспорт"])
+app.include_router(ai.router, prefix="/api", tags=["AI-анализ"])
 
 
 # =============================================================================
