@@ -56,15 +56,21 @@ class Settings(BaseSettings):
     # @computed_field — это поле вычисляется автоматически из других полей,
     # его НЕ нужно задавать в .env
 
+    # Если задана — используется напрямую (перекрывает сборку из db_host/port/user/pass).
+    # Удобно для socket-подключения: postgresql+psycopg2://user@/dbname?host=/var/run/postgresql
+    database_url: str = Field(default="", description="Полный URL БД (опционально)")
+
     @computed_field
     @property
     def db_url(self) -> str:
         """
         Строка подключения к PostgreSQL в формате SQLAlchemy.
 
-        Пример результата:
-            postgresql://maps_user:password@localhost:5432/maps_db
+        Если в .env задана DATABASE_URL — используется она.
+        Иначе собирается из отдельных параметров DB_HOST, DB_PORT и т.д.
         """
+        if self.database_url:
+            return self.database_url
         return (
             f"postgresql://{self.db_user}:{self.db_password}"
             f"@{self.db_host}:{self.db_port}/{self.db_name}"

@@ -12,13 +12,23 @@ app/db/models.py — ORM-модели (таблицы базы данных)
     session.commit()
     # В таблице works появится новая строка
 
+Слои распределения (порядок приоритета):
+    1. Списание (WriteOff)                    — фактически списано в SAP
+    2. Выдано не списано (IssuedNotWrittenOff) — выдано на объект, не проведено
+    3. Склад своего завода / филиала          — текущие остатки, FIFO
+    4. Поставки (Supply)                      — материалы в пути (по договору, по филиалу)
+    5. К закупу (DeficitRecord)               — дефицит, нужно закупить
+
+    Дополнительно (только для анализа, НЕ учитывается в дефиците):
+       Возможное перемещение — склады других филиалов (is_possible=True)
+
 Схема данных:
     ┌──────────────┐     ┌──────────────┐     ┌───────────────┐
     │    works     │     │  materials   │     │  warehouses   │
     ├──────────────┤     ├──────────────┤     ├───────────────┤
     │ id           │     │ id           │     │ id            │
     │ kod_raboty   │     │ sys_nomer    │     │ kod_sklada    │
-    │ filial       │     │ naimenovanie │     │ filial        │
+    │ is_emergency │     │ naimenovanie │     │ filial        │
     │ prioritet    │     │ ed_izm       │     │ zavod         │
     └──────┬───────┘     └──────┬───────┘     └──────┬────────┘
            │                   │                     │
@@ -30,14 +40,17 @@ app/db/models.py — ORM-модели (таблицы базы данных)
               │ work_id (FK) │         │ warehouse_id (FK)│
               │ material_id  │         │ material_id (FK) │
               │ potrebnost   │         │ kolichestvo      │
-              │ raspredeleno │         │ data_postupleniya│
-              └──────────────┘         └──────────────────┘
+              │ prognosnaya_ │         │ data_postupleniya│
+              │   tsena      │         └──────────────────┘
+              │ raspredeleno │
+              └──────────────┘
 """
 
 from datetime import date, datetime
 from decimal import Decimal
 
 from sqlalchemy import (
+    Boolean,
     Date,
     DateTime,
     ForeignKey,
@@ -61,20 +74,23 @@ class Work(Base):
     Таблица works — строительно-монтажные работы (СМР).
 
     Каждая строка = одна работа (заявка, наряд-задание и т.д.).
-    Работы конкурируют за материалы — побеждает тот, у кого выше приоритет
-    и раньше дата начала.
+    Работы конкурируют за материалы — порядок распределения:
+        1. Аварийные работы (is_emergency=True) — ВСЕГДА первыми, по дате начала
+        2. Обычные работы — по дате начала (ГЛАВНЫЙ приоритет), затем prioritet
     """
     __tablename__ = "works"
 
-    # Первичный ключ — уникальный ID, генерируется автоматически
     id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
 
     # Уникальный бизнес-код работы (из SAP PS/PM)
-    # Например: "P-2026-001", "WO-12345"
     kod_raboty: Mapped[str] = mapped_column(String(100), nullable=False, unique=True)
 
-    # Тип работы: "ТО" (техническое обслуживание), "Ремонт", "Монтаж" и т.д.
+    # Тип работы: "ТО", "Ремонт", "Монтаж", "Аварийный" и т.д.
     tip_raboty: Mapped[str | None] = mapped_column(String(100))
+
+    # Аварийная работа: True — загружается из отдельного файла и идёт самой первой.
+    # Внутри аварийных работ порядок — только по дате начала (prioritet не учитывается).
+    is_emergency: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
 
     # Организационная структура
     filial: Mapped[str | None] = mapped_column(String(100))         # Филиал компании
@@ -83,29 +99,30 @@ class Work(Base):
     zavod: Mapped[str | None] = mapped_column(String(50))           # Код завода (Plant в SAP)
 
     # Временные рамки
-    data_nachala: Mapped[date | None] = mapped_column(Date)         # Дата начала работ
+    data_nachala: Mapped[date | None] = mapped_column(Date)         # Дата начала — ГЛАВНЫЙ приоритет
     data_okonchaniya: Mapped[date | None] = mapped_column(Date)     # Дата окончания
 
-    # Приоритет определяет порядок распределения материалов:
-    #   1 — высший (аварийные работы, критичный путь)
-    #   2 — средний (плановые работы)
-    #   3 — низший (резервные работы)
+    # Приоритет для ОБЫЧНЫХ (не аварийных) работ:
+    #   1 — высший (критичный путь)
+    #   2 — средний (плановые)
+    #   3 — низший (резервные)
+    # Для аварийных работ (is_emergency=True) это поле НЕ учитывается при сортировке.
     prioritet: Mapped[int] = mapped_column(default=3)
 
     # Статус: "active", "completed", "cancelled", "on_hold"
     status: Mapped[str] = mapped_column(String(50), default="active")
 
-    # Дата и время создания записи (заполняется автоматически)
     created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(
         DateTime, server_default=func.now(), onupdate=func.now()
     )
 
-    # Связь с потребностями (один ко многим: одна работа → много потребностей)
+    # Связи
     requirements: Mapped[list["Requirement"]] = relationship(back_populates="work")
 
     def __repr__(self) -> str:
-        return f"<Work id={self.id} kod={self.kod_raboty!r} filial={self.filial!r} prio={self.prioritet}>"
+        emerg = " [АВАРИЙНАЯ]" if self.is_emergency else ""
+        return f"<Work id={self.id} kod={self.kod_raboty!r} filial={self.filial!r} prio={self.prioritet}{emerg}>"
 
 
 class Material(Base):
@@ -119,22 +136,15 @@ class Material(Base):
 
     id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
 
-    # Системный номер материала в SAP (18-значный код)
-    # Например: "000000000010012345"
+    # Системный номер материала в SAP (18-значный код): "000000000010012345"
     sys_nomer: Mapped[str] = mapped_column(String(50), nullable=False, unique=True)
 
-    # Понятное название: "Кабель ВВГ 3х2,5 мм"
     naimenovanie: Mapped[str | None] = mapped_column(Text)
-
-    # Единица измерения: "шт", "м", "кг", "л" и т.д.
     ed_izm: Mapped[str | None] = mapped_column(String(20))
-
-    # Группа материалов: "Кабели", "Трубы", "Арматура" и т.д.
     gruppa: Mapped[str | None] = mapped_column(String(100))
 
     created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
 
-    # Связи
     requirements: Mapped[list["Requirement"]] = relationship(back_populates="material")
     stock_batches: Mapped[list["StockBatch"]] = relationship(back_populates="material")
     supply_lines: Mapped[list["SupplyLine"]] = relationship(back_populates="material")
@@ -149,25 +159,31 @@ class Requirement(Base):
     Таблица requirements — потребности работ в материалах.
 
     Это связующая таблица между Work и Material.
-    Показывает: "Работа W-001 требует 50 кг кабеля ВВГ".
+    Показывает: "Работа W-001 требует 50 кг кабеля ВВГ по 1500 тг/кг".
 
     Поля raspredeleno и deficit обновляются алгоритмом распределения.
+
+    prognosnaya_tsena — прогнозная цена из исходной заявки. Используется для:
+      - Расчёта прогнозной стоимости потребности
+      - Формирования стоимости «К закупу»
+      - Расчёта % обеспечённости (по стоимости)
     """
     __tablename__ = "requirements"
     __table_args__ = (
-        # Составной уникальный индекс: одна работа не может дважды требовать
-        # один и тот же материал (дубли объединяются на этапе импорта)
         Index("ix_requirements_work_material", "work_id", "material_id", unique=True),
     )
 
     id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
 
-    # Внешние ключи (FK — Foreign Key): ссылаются на строки других таблиц
     work_id: Mapped[int] = mapped_column(ForeignKey("works.id"), nullable=False)
     material_id: Mapped[int] = mapped_column(ForeignKey("materials.id"), nullable=False)
 
     # Количество материала, которое нужно для этой работы
     potrebnost: Mapped[Decimal] = mapped_column(Numeric(18, 4), default=0)
+
+    # Прогнозная цена за единицу из исходной заявки (загружается при импорте потребностей)
+    # Используется для расчёта обеспечённости по стоимости и «К закупу»
+    prognosnaya_tsena: Mapped[Decimal] = mapped_column(Numeric(18, 4), default=0)
 
     # Количество уже распределённого материала (заполняется алгоритмом)
     raspredeleno: Mapped[Decimal] = mapped_column(Numeric(18, 4), default=0)
@@ -177,7 +193,6 @@ class Requirement(Base):
 
     created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
 
-    # Связи для удобного доступа к связанным объектам
     work: Mapped["Work"] = relationship(back_populates="requirements")
     material: Mapped["Material"] = relationship(back_populates="requirements")
 
@@ -188,30 +203,103 @@ class Requirement(Base):
         )
 
 
+class WriteOff(Base):
+    """
+    Таблица writeoffs — фактические списания материалов на работы (Слой 1).
+
+    Загружается из Excel-файла выгрузки SAP.
+    Это материалы, которые уже физически списаны — самый надёжный источник покрытия.
+
+    В алгоритме: применяется ПЕРВЫМ, уменьшает остаток потребности (remaining).
+    """
+    __tablename__ = "writeoffs"
+    __table_args__ = (
+        Index("ix_writeoffs_work_material", "work_id", "material_id"),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+
+    work_id: Mapped[int] = mapped_column(ForeignKey("works.id"), nullable=False)
+    material_id: Mapped[int] = mapped_column(ForeignKey("materials.id"), nullable=False)
+
+    # Количество и стоимость списания
+    kolichestvo: Mapped[Decimal] = mapped_column(Numeric(18, 4), default=0)
+    stoimost_za_ed: Mapped[Decimal] = mapped_column(Numeric(18, 4), default=0)
+    summa: Mapped[Decimal] = mapped_column(Numeric(18, 4), default=0)  # = qty * price
+
+    # Реквизиты документа списания (информативно)
+    nomer_dokumenta: Mapped[str | None] = mapped_column(String(100))
+    data_spisaniya: Mapped[date | None] = mapped_column(Date)
+
+    created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
+
+    work: Mapped["Work"] = relationship()
+    material: Mapped["Material"] = relationship()
+
+    def __repr__(self) -> str:
+        return f"<WriteOff work={self.work_id} mat={self.material_id} qty={self.kolichestvo}>"
+
+
+class IssuedNotWrittenOff(Base):
+    """
+    Таблица issued_not_written_off — выдано под работу, но ещё не списано (Слой 2).
+
+    Загружается из Excel-файла.
+    Материал уже находится на объекте (выдан со склада), но документ списания
+    ещё не оформлен в SAP.
+
+    В алгоритме: применяется ВТОРЫМ, после фактических списаний.
+    warehouse_id — информативное поле (не влияет на остатки склада).
+    """
+    __tablename__ = "issued_not_written_off"
+    __table_args__ = (
+        Index("ix_issued_work_material", "work_id", "material_id"),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+
+    work_id: Mapped[int] = mapped_column(ForeignKey("works.id"), nullable=False)
+    material_id: Mapped[int] = mapped_column(ForeignKey("materials.id"), nullable=False)
+
+    # Склад, с которого выдано — только для информации, остатки НЕ трогаем
+    warehouse_id: Mapped[int | None] = mapped_column(ForeignKey("warehouses.id"))
+
+    kolichestvo: Mapped[Decimal] = mapped_column(Numeric(18, 4), default=0)
+    stoimost_za_ed: Mapped[Decimal] = mapped_column(Numeric(18, 4), default=0)
+    summa: Mapped[Decimal] = mapped_column(Numeric(18, 4), default=0)
+
+    data_vydachi: Mapped[date | None] = mapped_column(Date)
+
+    created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
+
+    work: Mapped["Work"] = relationship()
+    material: Mapped["Material"] = relationship()
+
+    def __repr__(self) -> str:
+        return f"<IssuedNotWrittenOff work={self.work_id} mat={self.material_id} qty={self.kolichestvo}>"
+
+
 class Warehouse(Base):
     """
     Таблица warehouses — справочник складов.
 
     Склад имеет привязку к филиалу и заводу (Plant в SAP).
-    Эта привязка используется в алгоритме приоритетов:
-    материал сначала берётся со склада того же завода, что и работа.
+    Приоритеты распределения со склада:
+        1. Склад того же завода (zavod == work.zavod)
+        2. Склад того же филиала (filial == work.filial, другой завод)
+        3. Склады других филиалов — только «возможное» (не фактическое)
     """
     __tablename__ = "warehouses"
 
     id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
 
-    # Код склада в SAP: например "0001", "W-ALM-01"
     kod_sklada: Mapped[str] = mapped_column(String(50), nullable=False, unique=True)
-
-    # Тип: "центральный", "филиальный", "подрядчика"
     tip_sklada: Mapped[str | None] = mapped_column(String(50))
-
-    filial: Mapped[str | None] = mapped_column(String(100))  # Филиал
-    zavod: Mapped[str | None] = mapped_column(String(50))    # Код завода (Plant)
+    filial: Mapped[str | None] = mapped_column(String(100))
+    zavod: Mapped[str | None] = mapped_column(String(50))
 
     created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
 
-    # Связи
     stock_batches: Mapped[list["StockBatch"]] = relationship(back_populates="warehouse")
 
     def __repr__(self) -> str:
@@ -222,23 +310,15 @@ class StockBatch(Base):
     """
     Таблица stock_batches — партии материалов на складах.
 
-    Почему партии, а не просто остаток?
-        Разные партии могут иметь разную стоимость (цену закупки).
-        При списании важно знать, по какой цене списывается материал.
-        FIFO (First In First Out) — сначала списываются более старые партии.
+    Разные партии могут иметь разную цену закупки.
+    FIFO (First In First Out) — сначала списываются старые партии.
 
-    Пример:
-        Склад W-001, Материал "Кабель ВВГ":
-          Партия 001: 100 м, 500 тг/м, поступила 01.01.2026
-          Партия 002: 200 м, 520 тг/м, поступила 15.02.2026
-
-        По FIFO сначала будем списывать Партию 001.
+    При агрегации нескольких партий одного склада считается средняя взвешенная цена:
+        avg = sum(qty_i * price_i) / sum(qty_i)
     """
     __tablename__ = "stock_batches"
     __table_args__ = (
-        # Индекс для быстрого поиска партий по материалу
         Index("ix_stock_batches_material", "material_id"),
-        # Индекс для FIFO-сортировки по дате поступления
         Index("ix_stock_batches_fifo", "material_id", "data_postupleniya"),
     )
 
@@ -247,26 +327,17 @@ class StockBatch(Base):
     warehouse_id: Mapped[int] = mapped_column(ForeignKey("warehouses.id"), nullable=False)
     material_id: Mapped[int] = mapped_column(ForeignKey("materials.id"), nullable=False)
 
-    # Номер партии (из SAP или присвоенный при импорте)
     nomer_partii: Mapped[str | None] = mapped_column(String(100))
-
-    # Текущее количество в партии
     kolichestvo: Mapped[Decimal] = mapped_column(Numeric(18, 4), default=0)
 
-    # Доступное количество (kolichestvo минус уже зарезервированное)
-    # Обновляется алгоритмом распределения
+    # Доступное количество — обновляется алгоритмом (уменьшается при распределении)
     dostupno: Mapped[Decimal] = mapped_column(Numeric(18, 4), default=0)
 
-    # Стоимость за единицу в этой партии (в тенге или другой валюте)
     stoimost_za_ed: Mapped[Decimal] = mapped_column(Numeric(18, 4), default=0)
-
-    # Дата поступления партии на склад — используется для FIFO-сортировки
-    # Чем раньше дата → тем раньше используется партия
-    data_postupleniya: Mapped[date | None] = mapped_column(Date)
+    data_postupleniya: Mapped[date | None] = mapped_column(Date)  # Для FIFO-сортировки
 
     created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
 
-    # Связи
     warehouse: Mapped["Warehouse"] = relationship(back_populates="stock_batches")
     material: Mapped["Material"] = relationship(back_populates="stock_batches")
 
@@ -279,53 +350,41 @@ class StockBatch(Base):
 
 class Supply(Base):
     """
-    Таблица supplies — заказы на поставку (материалы "в пути").
+    Таблица supplies — заказы на поставку (материалы «в пути»).
 
-    Это материалы, которые уже заказаны, но ещё не поступили на склад.
-    Алгоритм распределения может резервировать их для работ.
-
-    Статусы поставки:
-        "confirmed" — подтверждено поставщиком
-        "in_transit" — груз отправлен
-        "arrived"   — прибыло, ожидает оприходования
-        "cancelled" — отменено
+    Поставки идут на ФИЛИАЛ (не на завод).
+    Это ключевое отличие от складских остатков: при распределении
+    из поставок мы сравниваем filial работы с filial поставки.
     """
     __tablename__ = "supplies"
 
     id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
 
-    # Реквизиты поставки
-    dogovor: Mapped[str | None] = mapped_column(String(100))      # Номер договора
-    postavshchik: Mapped[str | None] = mapped_column(String(200)) # Наименование поставщика
+    dogovor: Mapped[str | None] = mapped_column(String(100))       # Номер договора
+    postavshchik: Mapped[str | None] = mapped_column(String(200))  # Наименование поставщика
 
-    # На какой склад ожидается поставка
     warehouse_id: Mapped[int | None] = mapped_column(ForeignKey("warehouses.id"))
 
-    # Организационная привязка (если склад не указан)
+    # Поставки привязаны к ФИЛИАЛУ — используется для сопоставления с работой
     filial: Mapped[str | None] = mapped_column(String(100))
     zavod: Mapped[str | None] = mapped_column(String(50))
 
-    # Ожидаемая дата поставки (используется для анализа рисков)
     data_postavki: Mapped[date | None] = mapped_column(Date)
-
-    # Статус поставки
     status: Mapped[str] = mapped_column(String(50), default="confirmed")
 
     created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
 
-    # Связи
     lines: Mapped[list["SupplyLine"]] = relationship(back_populates="supply")
 
     def __repr__(self) -> str:
-        return f"<Supply id={self.id} dogovor={self.dogovor!r} date={self.data_postavki}>"
+        return f"<Supply id={self.id} dogovor={self.dogovor!r} filial={self.filial!r} date={self.data_postavki}>"
 
 
 class SupplyLine(Base):
     """
     Таблица supply_lines — строки поставки (конкретные материалы в поставке).
 
-    Одна поставка (Supply) может содержать несколько материалов.
-    Каждый материал — это отдельная строка (SupplyLine).
+    Одна поставка (Supply) → много материалов (SupplyLine).
     """
     __tablename__ = "supply_lines"
     __table_args__ = (
@@ -337,16 +396,10 @@ class SupplyLine(Base):
     supply_id: Mapped[int] = mapped_column(ForeignKey("supplies.id"), nullable=False)
     material_id: Mapped[int] = mapped_column(ForeignKey("materials.id"), nullable=False)
 
-    # Количество в поставке
     kolichestvo: Mapped[Decimal] = mapped_column(Numeric(18, 4), default=0)
-
-    # Доступное количество (обновляется алгоритмом)
     dostupno: Mapped[Decimal] = mapped_column(Numeric(18, 4), default=0)
-
-    # Стоимость за единицу в этой поставке
     stoimost_za_ed: Mapped[Decimal] = mapped_column(Numeric(18, 4), default=0)
 
-    # Связи
     supply: Mapped["Supply"] = relationship(back_populates="lines")
     material: Mapped["Material"] = relationship(back_populates="supply_lines")
 
@@ -362,30 +415,22 @@ class AllocationSession(Base):
     """
     Таблица allocation_sessions — сессии запуска распределения.
 
-    Зачем нужна сессия?
-        Каждый запуск алгоритма создаёт новую сессию.
-        Это позволяет:
-          - Хранить несколько вариантов распределения (сценарии)
-          - Сравнивать результаты разных запусков
-          - Откатиться к предыдущему варианту
+    Каждый запуск алгоритма создаёт новую сессию.
+    Позволяет хранить несколько вариантов распределения (сценарии).
     """
     __tablename__ = "allocation_sessions"
 
-    id: Mapped[str] = mapped_column(String(100), primary_key=True)  # UUID или "2026-05-23_run1"
+    id: Mapped[str] = mapped_column(String(100), primary_key=True)
     started_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
     completed_at: Mapped[datetime | None] = mapped_column(DateTime)
-
-    # Статус: "running", "completed", "failed"
     status: Mapped[str] = mapped_column(String(50), default="running")
 
-    # Статистика сессии
-    total_requirements: Mapped[int] = mapped_column(default=0)  # Всего потребностей
-    total_allocated: Mapped[int] = mapped_column(default=0)     # Распределено строк
-    total_deficit: Mapped[int] = mapped_column(default=0)       # Строк с дефицитом
+    total_requirements: Mapped[int] = mapped_column(default=0)
+    total_allocated: Mapped[int] = mapped_column(default=0)
+    total_deficit: Mapped[int] = mapped_column(default=0)
 
-    notes: Mapped[str | None] = mapped_column(Text)  # Произвольные заметки
+    notes: Mapped[str | None] = mapped_column(Text)
 
-    # Связи с результатами
     allocations: Mapped[list["AllocationResult"]] = relationship(back_populates="session")
     movements: Mapped[list["StockMovement"]] = relationship(back_populates="session")
     deficits: Mapped[list["DeficitRecord"]] = relationship(back_populates="session")
@@ -396,16 +441,22 @@ class AllocationSession(Base):
 
 class AllocationResult(Base):
     """
-    Таблица allocation_results — результаты распределения.
+    Таблица allocation_results — результаты распределения по слоям.
 
-    Каждая строка = одно распределение:
-    "Для работы W-001, материала 'Кабель ВВГ', выделено 50 м
-     из склада SKL-01, партии 002, по цене 520 тг/м".
+    Каждая строка = одно распределение для одной потребности.
 
-    Источники (istochnik):
-        "sklad"   — распределено со склада
-        "postavka" — зарезервировано из поставки "в пути"
-        "zakup"   — дефицит, нужно закупить
+    Значения istochnik:
+        "spisanie"         — Слой 1: фактически списано (из WriteOff)
+        "vydano"           — Слой 2: выдано не списано (из IssuedNotWrittenOff)
+        "sklad"            — Слой 3: распределено со склада (того же завода/филиала)
+        "vozmozhnoe_sklad" — Анализ: склад другого филиала (is_possible=True)
+        "postavka"         — Слой 4: зарезервировано из поставки
+        "zakup"            — Слой 5: дефицит, нужно закупить
+
+    Для is_possible=True (возможное движение):
+        - Остатки НЕ уменьшаются
+        - В дефиците НЕ участвует
+        - Используется только для анализа межфилиального переноса
     """
     __tablename__ = "allocation_results"
     __table_args__ = (
@@ -421,36 +472,27 @@ class AllocationResult(Base):
     work_id: Mapped[int] = mapped_column(ForeignKey("works.id"), nullable=False)
     material_id: Mapped[int] = mapped_column(ForeignKey("materials.id"), nullable=False)
 
-    # Источник материала:
-    #   "sklad"            — фактически распределено со склада (тот же завод или филиал)
-    #   "vozmozhnoe_sklad" — возможное распределение (другой филиал, требует согласования)
-    #   "postavka"         — зарезервировано из поставки "в пути"
-    #   "zakup"            — дефицит, нужно закупить
     istochnik: Mapped[str] = mapped_column(String(50))
 
     # Откуда взяли (если со склада/поставки)
     warehouse_id: Mapped[int | None] = mapped_column(ForeignKey("warehouses.id"))
     supply_line_id: Mapped[int | None] = mapped_column(ForeignKey("supply_lines.id"))
 
-    # Сколько и по какой СРЕДНЕЙ цене.
-    # Средняя взвешенная = sum(qty_i * price_i) / sum(qty_i) по всем партиям с одного склада.
-    # Почему средняя, а не цена конкретной партии?
-    #   На одном складе может быть несколько партий с разными ценами.
-    #   Для работы важна итоговая стоимость, а не разбивка по партиям.
+    # Количество и средняя взвешенная стоимость.
+    # Для склада: weighted avg по всем партиям с одного склада.
+    # Для слоёв 1, 2, 4: avg по записям в источнике.
     kolichestvo: Mapped[Decimal] = mapped_column(Numeric(18, 4), default=0)
     srednyaya_stoimost: Mapped[Decimal] = mapped_column(Numeric(18, 4), default=0)
-    summa: Mapped[Decimal] = mapped_column(Numeric(18, 4), default=0)  # = kolichestvo * srednyaya_stoimost
+    summa: Mapped[Decimal] = mapped_column(Numeric(18, 4), default=0)
 
-    # Приоритет склада: "zavod" (тот же завод), "filial" (тот же филиал), "vozmozhnoe" (другой филиал)
+    # Уточнение для складского распределения: "zavod" / "filial" / "vozmozhnoe"
     tip_raspredeleniya: Mapped[str | None] = mapped_column(String(50))
 
-    # True = возможное (не фактическое) распределение — материал другого филиала
-    # False = фактическое распределение (остатки реально уменьшены)
+    # True = возможное (анализ), False = фактическое (меняет остатки)
     is_possible: Mapped[bool] = mapped_column(default=False)
 
     created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
 
-    # Связи
     session: Mapped["AllocationSession"] = relationship(back_populates="allocations")
 
     def __repr__(self) -> str:
@@ -462,11 +504,10 @@ class AllocationResult(Base):
 
 class StockMovement(Base):
     """
-    Таблица stock_movements — движение по складам.
+    Таблица stock_movements — движение по складам (детально, по партиям).
 
-    Фиксирует каждое списание со склада:
-    "Со склада SKL-01, партии 002, списано 50 м кабеля для работы W-001.
-     Остаток партии стал 150 м."
+    Фиксирует каждое списание со склада по конкретной партии.
+    Используется для детального листа «Движение склада» в Excel-отчёте.
     """
     __tablename__ = "stock_movements"
     __table_args__ = (
@@ -482,15 +523,11 @@ class StockMovement(Base):
     batch_id: Mapped[int | None] = mapped_column(ForeignKey("stock_batches.id"))
     work_id: Mapped[int | None] = mapped_column(ForeignKey("works.id"))
 
-    # Изменение количества (отрицательное = списание)
-    izmenenie: Mapped[Decimal] = mapped_column(Numeric(18, 4), default=0)
-
-    # Остаток партии ПОСЛЕ этого движения
-    ostatok: Mapped[Decimal] = mapped_column(Numeric(18, 4), default=0)
+    izmenenie: Mapped[Decimal] = mapped_column(Numeric(18, 4), default=0)  # Отрицательное = расход
+    ostatok: Mapped[Decimal] = mapped_column(Numeric(18, 4), default=0)    # После движения
 
     data_dvizheniya: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
 
-    # Связь
     session: Mapped["AllocationSession"] = relationship(back_populates="movements")
 
     def __repr__(self) -> str:
@@ -502,10 +539,9 @@ class StockMovement(Base):
 
 class DeficitRecord(Base):
     """
-    Таблица deficit_records — записи о дефиците.
+    Таблица deficit_records — записи о дефиците (Слой 5: К закупу).
 
-    Создаётся когда потребность работы не покрыта ни складом, ни поставками.
-    Используется для формирования плана закупок.
+    Создаётся когда потребность не покрыта ни одним из слоёв 1-4.
     """
     __tablename__ = "deficit_records"
     __table_args__ = (
@@ -520,18 +556,15 @@ class DeficitRecord(Base):
     work_id: Mapped[int] = mapped_column(ForeignKey("works.id"), nullable=False)
     material_id: Mapped[int] = mapped_column(ForeignKey("materials.id"), nullable=False)
 
-    # Размер дефицита
     deficit_qty: Mapped[Decimal] = mapped_column(Numeric(18, 4), default=0)
 
-    # Ориентировочная стоимость (если известна цена)
+    # Оценочная стоимость дефицита = deficit_qty × prognosnaya_tsena из Requirement
     estimated_cost: Mapped[Decimal] = mapped_column(Numeric(18, 4), default=0)
 
-    # Когда нужен материал (дата окончания работы)
-    needed_by: Mapped[date | None] = mapped_column(Date)
+    needed_by: Mapped[date | None] = mapped_column(Date)  # Дата окончания работы
 
     created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
 
-    # Связь
     session: Mapped["AllocationSession"] = relationship(back_populates="deficits")
 
     def __repr__(self) -> str:

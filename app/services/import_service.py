@@ -3,26 +3,40 @@ app/services/import_service.py — Сервис импорта данных из
 
 Что делает этот модуль?
     Читает Excel-файлы с исходными данными и загружает их в PostgreSQL.
-    Поддерживает три типа файлов:
-      1. Потребности — что нужно для каждой работы
-      2. Складские остатки — что есть на складах (партии)
-      3. Поставки — что ожидается ("в пути")
+    Поддерживает пять типов файлов:
+
+    1. Потребности (import_requirements)
+       Что нужно для каждой работы: материал, количество, прогнозная цена.
+
+    2. Аварийные работы (import_emergency_works)
+       Отдельный файл с тем же форматом, что и потребности,
+       но все работы в нём помечаются как is_emergency=True.
+       Они получат наивысший приоритет в очереди распределения.
+
+    3. Складские остатки (import_stock)
+       Текущие остатки материалов на складах (партии).
+
+    4. Поставки (import_supplies)
+       Материалы, которые уже заказаны и ожидаются («в пути»).
+
+    5. Фактические списания (import_writeoffs)
+       Материалы, уже документально списанные на работы в SAP (Слой 1).
+
+    6. Выдано не списано (import_issued_not_written_off)
+       Материалы, выданные на объект без оформления документа (Слой 2).
 
 Как устроен процесс импорта?
     Excel файл
-       ↓ pandas.read_excel()
+       ↓ pandas.read_excel()           (чтение)
     DataFrame (таблица в памяти)
-       ↓ Валидация через Pydantic (каждая строка)
-    Список объектов (WorkImportRow, StockImportRow, SupplyImportRow)
-       ↓ Сохранение в PostgreSQL через SQLAlchemy
-    Таблицы БД (works, requirements, stock_batches, supplies)
+       ↓ Pydantic-валидация (каждая строка)
+    Список Python-объектов
+       ↓ SQLAlchemy ORM
+    Таблицы PostgreSQL
 
 Почему pandas?
-    pandas умеет читать сложные Excel-файлы:
-    - Любое количество листов
-    - Разные форматы дат
-    - Смешанные типы данных в колонках
-    И возвращает удобную таблицу (DataFrame) для дальнейшей обработки.
+    pandas умеет читать сложные Excel-файлы с разными форматами дат,
+    смешанными типами данных и любым числом листов.
 """
 
 from pathlib import Path
@@ -33,8 +47,21 @@ from pydantic import ValidationError
 
 from app.core.logging_config import get_logger
 from app.db.database import get_session
-from app.db.models import StockBatch, Supply, SupplyLine, Warehouse
-from app.models.schemas import StockImportRow, SupplyImportRow, WorkImportRow
+from app.db.models import (
+    IssuedNotWrittenOff,
+    StockBatch,
+    Supply,
+    SupplyLine,
+    Warehouse,
+    WriteOff,
+)
+from app.models.schemas import (
+    IssuedNotWrittenOffImportRow,
+    StockImportRow,
+    SupplyImportRow,
+    WorkImportRow,
+    WriteOffImportRow,
+)
 from app.repositories.material_repository import MaterialRepository, StockBatchRepository
 from app.repositories.work_repository import RequirementRepository, WorkRepository
 
@@ -42,61 +69,89 @@ logger = get_logger(__name__)
 
 
 # =============================================================================
-# Конфигурация колонок Excel
+# Карты столбцов Excel → поля схем Pydantic
 # =============================================================================
-# Здесь описываем соответствие: имя колонки в Excel → имя поля в схеме Pydantic.
-# Это позволяет легко адаптировать импорт под разные форматы Excel-файлов
-# без изменения бизнес-логики.
+# Что такое column_map?
+#     Словарь вида {"Имя колонки в Excel": "имя_поля_в_схеме"}.
+#     Позволяет переименовать колонки при импорте, не меняя бизнес-логику.
+#     Если клиент даст файл с другими заголовками — меняем только этот словарь.
 
-# Колонки для файла потребностей
+# Колонки для файла потребностей (и аварийных работ — тот же формат)
 REQUIREMENTS_COLUMN_MAP = {
-    # "Имя колонки в Excel": "имя_поля_в_схеме"
-    "Код работы": "kod_raboty",
-    "Тип работы": "tip_raboty",
-    "Филиал": "filial",
-    "Подразделение": "podrazdelenie",
-    "Центр затрат": "centr_zatrat",
-    "Завод": "zavod",
-    "Дата начала": "data_nachala",
-    "Дата окончания": "data_okonchaniya",
-    "Приоритет": "prioritet",
-    "Статус": "status",
-    "Системный номер": "sys_nomer_materiala",
+    "Код работы":           "kod_raboty",
+    "Тип работы":           "tip_raboty",
+    "Филиал":               "filial",
+    "Подразделение":        "podrazdelenie",
+    "Центр затрат":         "centr_zatrat",
+    "Завод":                "zavod",
+    "Дата начала":          "data_nachala",
+    "Дата окончания":       "data_okonchaniya",
+    "Приоритет":            "prioritet",
+    "Статус":               "status",
+    "Системный номер":      "sys_nomer_materiala",
     "Наименование материала": "naimenovanie_materiala",
-    "Ед.изм": "ed_izm",
-    "Потребность": "potrebnost",
+    "Ед.изм":               "ed_izm",
+    "Потребность":          "potrebnost",
+    # НОВОЕ: прогнозная цена из заявки — для расчёта обеспечённости по стоимости
+    "Прогнозная цена":      "prognosnaya_tsena",
 }
 
 # Колонки для файла складских остатков
 STOCK_COLUMN_MAP = {
-    "Код склада": "kod_sklada",
-    "Тип склада": "tip_sklada",
-    "Филиал склада": "filial_sklada",
-    "Завод склада": "zavod_sklada",
-    "Системный номер": "sys_nomer_materiala",
+    "Код склада":           "kod_sklada",
+    "Тип склада":           "tip_sklada",
+    "Филиал склада":        "filial_sklada",
+    "Завод склада":         "zavod_sklada",
+    "Системный номер":      "sys_nomer_materiala",
     "Наименование материала": "naimenovanie_materiala",
-    "Ед.изм": "ed_izm",
-    "Группа материала": "gruppa_materiala",
-    "Номер партии": "nomer_partii",
-    "Количество": "kolichestvo",
-    "Стоимость за ед": "stoimost_za_ed",
-    "Дата поступления": "data_postupleniya",
+    "Ед.изм":               "ed_izm",
+    "Группа материала":     "gruppa_materiala",
+    "Номер партии":         "nomer_partii",
+    "Количество":           "kolichestvo",
+    "Стоимость за ед":      "stoimost_za_ed",
+    "Дата поступления":     "data_postupleniya",
 }
 
 # Колонки для файла поставок
 SUPPLY_COLUMN_MAP = {
-    "Договор": "dogovor",
-    "Поставщик": "postavshchik",
-    "Код склада": "kod_sklada",
-    "Филиал": "filial",
-    "Завод": "zavod",
-    "Системный номер": "sys_nomer_materiala",
+    "Договор":              "dogovor",
+    "Поставщик":            "postavshchik",
+    "Код склада":           "kod_sklada",
+    "Филиал":               "filial",
+    "Завод":                "zavod",
+    "Системный номер":      "sys_nomer_materiala",
     "Наименование материала": "naimenovanie_materiala",
-    "Ед.изм": "ed_izm",
-    "Дата поставки": "data_postavki",
-    "Количество": "kolichestvo",
-    "Стоимость за ед": "stoimost_za_ed",
-    "Статус": "status",
+    "Ед.изм":               "ed_izm",
+    "Дата поставки":        "data_postavki",
+    "Количество":           "kolichestvo",
+    "Стоимость за ед":      "stoimost_za_ed",
+    "Статус":               "status",
+}
+
+# Колонки для файла фактических списаний (Слой 1)
+WRITEOFF_COLUMN_MAP = {
+    "Код работы":           "kod_raboty",
+    "Системный номер":      "sys_nomer_materiala",
+    "Наименование материала": "naimenovanie_materiala",
+    "Ед.изм":               "ed_izm",
+    "Количество":           "kolichestvo",
+    "Стоимость за ед":      "stoimost_za_ed",
+    "Сумма":                "summa",
+    "Номер документа":      "nomer_dokumenta",
+    "Дата списания":        "data_spisaniya",
+}
+
+# Колонки для файла «Выдано не списано» (Слой 2)
+ISSUED_COLUMN_MAP = {
+    "Код работы":           "kod_raboty",
+    "Системный номер":      "sys_nomer_materiala",
+    "Наименование материала": "naimenovanie_materiala",
+    "Ед.изм":               "ed_izm",
+    "Количество":           "kolichestvo",
+    "Стоимость за ед":      "stoimost_za_ed",
+    "Сумма":                "summa",
+    "Код склада":           "kod_sklada",
+    "Дата выдачи":          "data_vydachi",
 }
 
 
@@ -104,20 +159,25 @@ SUPPLY_COLUMN_MAP = {
 # Вспомогательные функции
 # =============================================================================
 
-def _read_excel(file_path: Path, sheet_name: str = 0) -> pd.DataFrame:
+def _read_excel(file_path: Path, sheet_name: int | str = 0) -> pd.DataFrame:
     """
     Прочитать Excel файл и вернуть DataFrame.
 
     Args:
         file_path:  Путь к файлу .xlsx
-        sheet_name: Имя листа или его номер (0 = первый лист)
+        sheet_name: Имя листа или его порядковый номер (0 = первый лист)
 
     Returns:
-        DataFrame со всеми строками файла
+        DataFrame со строками файла
 
     Raises:
         FileNotFoundError: Если файл не найден
-        ValueError:        Если файл повреждён или не является Excel
+        ValueError:        Если файл повреждён или не Excel
+
+    Почему dtype=str?
+        Мы читаем всё как строки и доверяем Pydantic-валидации преобразование.
+        Это избегает ситуации, когда pandas самостоятельно превращает
+        код "10012345" в число 10012345.0.
     """
     if not file_path.exists():
         raise FileNotFoundError(f"Файл не найден: {file_path}")
@@ -127,14 +187,14 @@ def _read_excel(file_path: Path, sheet_name: str = 0) -> pd.DataFrame:
     df = pd.read_excel(
         file_path,
         sheet_name=sheet_name,
-        dtype=str,          # Читаем всё как строки — Pydantic сам приведёт типы
-        keep_default_na=False,  # Не заменять пустые ячейки на NaN
+        dtype=str,               # Все колонки как строки — Pydantic сам приведёт типы
+        keep_default_na=False,   # Пустые ячейки оставляем пустыми строками, не NaN
     )
 
-    # Убираем пустые строки (где все значения пустые)
+    # Удаляем полностью пустые строки (где ВСЕ ячейки пустые)
     df = df.dropna(how="all")
 
-    # Убираем пробелы в именах колонок (частая проблема Excel)
+    # Убираем лишние пробелы в именах колонок (типичная проблема Excel)
     df.columns = [str(c).strip() for c in df.columns]
 
     logger.info("Прочитано строк: %d, колонок: %d", len(df), len(df.columns))
@@ -143,29 +203,39 @@ def _read_excel(file_path: Path, sheet_name: str = 0) -> pd.DataFrame:
 
 def _rename_columns(df: pd.DataFrame, column_map: dict[str, str]) -> pd.DataFrame:
     """
-    Переименовать колонки согласно маппингу.
+    Переименовать колонки Excel согласно маппингу.
 
-    Переименовываем только те колонки, которые есть в файле.
-    Лишние колонки (которых нет в маппинге) — оставляем как есть.
+    Колонки, которых нет в маппинге — оставляем без изменений.
+    Если в файле нет ожидаемой колонки — выводим предупреждение.
     """
-    # Строим обратный маппинг только для существующих колонок
+    # Строим только тот маппинг, для которого колонки реально есть в файле
     rename_map = {
         excel_col: schema_field
         for excel_col, schema_field in column_map.items()
         if excel_col in df.columns
     }
 
-    # Предупреждаем о пропущенных колонках
+    # Сообщаем об отсутствующих колонках (может быть нормально, поля необязательные)
     missing = set(column_map.keys()) - set(df.columns)
     if missing:
-        logger.warning("В файле отсутствуют колонки: %s", missing)
+        logger.warning("В файле отсутствуют колонки: %s", sorted(missing))
 
     return df.rename(columns=rename_map)
 
 
-def _get_or_create_warehouse(session, kod_sklada: str, tip_sklada: Optional[str],
-                              filial: Optional[str], zavod: Optional[str]) -> Warehouse:
-    """Получить или создать запись о складе."""
+def _get_or_create_warehouse(
+    session,
+    kod_sklada: str,
+    tip_sklada: Optional[str],
+    filial: Optional[str],
+    zavod: Optional[str],
+) -> Warehouse:
+    """
+    Получить или создать склад по коду.
+
+    Склады создаются автоматически при импорте остатков/поставок.
+    Код склада (kod_sklada) — уникальный идентификатор.
+    """
     from sqlalchemy import select
     stmt = select(Warehouse).where(Warehouse.kod_sklada == kod_sklada)
     warehouse = session.scalar(stmt)
@@ -177,31 +247,36 @@ def _get_or_create_warehouse(session, kod_sklada: str, tip_sklada: Optional[str]
             zavod=zavod,
         )
         session.add(warehouse)
-        session.flush()  # Чтобы получить id склада
+        session.flush()  # flush нужен чтобы PostgreSQL назначил id прямо сейчас
     return warehouse
 
 
 # =============================================================================
-# Импорт потребностей
+# Импорт потребностей (обычные работы)
 # =============================================================================
 
-def import_requirements(file_path: Path, sheet_name: str = 0) -> dict[str, int]:
+def import_requirements(file_path: Path, sheet_name: int | str = 0) -> dict[str, int]:
     """
     Импортировать потребности работ в материалах из Excel.
 
     Файл содержит строки вида:
-    | Код работы | Системный номер | Наименование | Потребность | Дата начала | ...
+    | Код работы | Системный номер | Потребность | Прогнозная цена | Дата начала | ... |
 
-    Одна работа может иметь много материалов → много строк в Excel →
+    Одна работа → много материалов → много строк Excel →
     → одна строка в works + много строк в requirements.
+
+    Прогнозная цена (prognosnaya_tsena):
+        Цена за единицу из исходной заявки.
+        Используется для расчёта % обеспечённости по стоимости и стоимости «К закупу».
 
     Args:
         file_path:  Путь к Excel файлу
-        sheet_name: Лист (по умолчанию первый)
+        sheet_name: Лист (0 = первый)
 
     Returns:
-        Статистика: {"works": 50, "requirements": 1200, "errors": 3}
+        Статистика {"works": 50, "requirements": 1200, "errors": 3}
     """
+    # Читаем файл и переименовываем колонки
     df = _read_excel(file_path, sheet_name)
     df = _rename_columns(df, REQUIREMENTS_COLUMN_MAP)
 
@@ -213,29 +288,34 @@ def import_requirements(file_path: Path, sheet_name: str = 0) -> dict[str, int]:
         material_repo = MaterialRepository(session)
         req_repo = RequirementRepository(session)
 
-        # Загружаем текущие данные для быстрого поиска (избегаем N+1 запросов)
-        existing_works = work_repo.get_kod_map()      # {kod_raboty: id}
+        # Предзагружаем существующие работы и материалы в словари для O(1) поиска.
+        # Это важная оптимизация: без неё импорт 10 000 строк = 10 000 SELECT-запросов.
+        existing_works = work_repo.get_kod_map()         # {kod_raboty: id}
         existing_materials = material_repo.get_id_map()  # {sys_nomer: id}
 
+        # Отслеживаем новые записи внутри текущей сессии (ещё не в словарях выше)
         new_works_in_session: set[str] = set()
         new_materials_in_session: set[str] = set()
 
         for row_num, row in df.iterrows():
             row_dict = row.to_dict()
 
-            # --- Валидация через Pydantic ---
+            # --- Валидация строки через Pydantic ---
             try:
                 validated = WorkImportRow(**row_dict)
             except ValidationError as e:
+                # Первая ошибка из списка — обычно самая понятная
                 error_msg = f"Строка {row_num + 2}: {e.errors()[0]['msg']}"
                 errors.append(error_msg)
                 stats["errors"] += 1
                 logger.warning("Ошибка валидации | %s", error_msg)
-                continue
+                continue  # Пропускаем строку с ошибкой, продолжаем дальше
 
-            # --- Обрабатываем работу (Work) ---
-            if validated.kod_raboty not in existing_works and validated.kod_raboty not in new_works_in_session:
-                work = work_repo.get_or_create(
+            # --- Создаём работу если её ещё нет ---
+            # Проверяем: нет в БД И нет среди новых в этой сессии
+            if (validated.kod_raboty not in existing_works
+                    and validated.kod_raboty not in new_works_in_session):
+                work_repo.get_or_create(
                     kod_raboty=validated.kod_raboty,
                     tip_raboty=validated.tip_raboty,
                     filial=validated.filial,
@@ -246,12 +326,14 @@ def import_requirements(file_path: Path, sheet_name: str = 0) -> dict[str, int]:
                     data_okonchaniya=validated.data_okonchaniya,
                     prioritet=validated.prioritet,
                     status=validated.status,
+                    is_emergency=False,  # Обычный файл — не аварийные работы
                 )
                 new_works_in_session.add(validated.kod_raboty)
                 stats["works"] += 1
 
-            # --- Обрабатываем материал (Material) ---
-            if validated.sys_nomer_materiala not in existing_materials and validated.sys_nomer_materiala not in new_materials_in_session:
+            # --- Создаём материал если его ещё нет ---
+            if (validated.sys_nomer_materiala not in existing_materials
+                    and validated.sys_nomer_materiala not in new_materials_in_session):
                 material_repo.get_or_create(
                     sys_nomer=validated.sys_nomer_materiala,
                     naimenovanie=validated.naimenovanie_materiala,
@@ -259,23 +341,24 @@ def import_requirements(file_path: Path, sheet_name: str = 0) -> dict[str, int]:
                 )
                 new_materials_in_session.add(validated.sys_nomer_materiala)
 
-            # Flush чтобы получить ID новых объектов
+            # Flush: сбрасываем накопленные INSERT в PostgreSQL чтобы получить ID.
+            # Делаем это периодически (не каждую строку) для производительности.
             if stats["requirements"] % 500 == 0:
                 session.flush()
+            session.flush()  # Гарантируем наличие ID перед созданием потребности
 
-            # --- Создаём потребность (Requirement) ---
-            # Получаем ID работы и материала (могут быть новыми — флашим сначала)
-            session.flush()
-
-            # Ищем work и material по коду
+            # --- Создаём потребность ---
+            # Находим работу и материал по их кодам (теперь они уже в БД)
             work = work_repo.get_by_kod(validated.kod_raboty)
             material = material_repo.get_by_sys_nomer(validated.sys_nomer_materiala)
 
             if work and material:
+                # upsert: если такая пара работа+материал уже есть — суммируем количество
                 req_repo.upsert(
                     work_id=work.id,
                     material_id=material.id,
                     potrebnost=validated.potrebnost,
+                    prognosnaya_tsena=validated.prognosnaya_tsena,  # НОВОЕ
                 )
                 stats["requirements"] += 1
 
@@ -285,28 +368,146 @@ def import_requirements(file_path: Path, sheet_name: str = 0) -> dict[str, int]:
         )
 
     if errors:
-        logger.warning("Ошибки при импорте:\n%s", "\n".join(errors[:10]))
+        logger.warning("Первые ошибки при импорте:\n%s", "\n".join(errors[:10]))
 
     return stats
 
 
 # =============================================================================
-# Импорт складских остатков
+# Импорт аварийных работ
 # =============================================================================
 
-def import_stock(file_path: Path, sheet_name: str = 0) -> dict[str, int]:
+def import_emergency_works(file_path: Path, sheet_name: int | str = 0) -> dict[str, int]:
+    """
+    Импортировать аварийные работы из отдельного Excel файла.
+
+    Что такое аварийные работы?
+        Это критичные работы — аварии на оборудовании, нарушения безопасности.
+        Они должны получить материалы ДО любых плановых работ.
+        В MAPS они помечаются is_emergency=True и идут первыми в очереди.
+
+    Формат файла:
+        ТАКОЙ ЖЕ, как обычный файл потребностей (REQUIREMENTS_COLUMN_MAP).
+        Единственное отличие — все работы в нём считаются аварийными.
+        Поле «Приоритет» в файле НЕ влияет на порядок внутри аварийных работ:
+        они сортируются ТОЛЬКО по дате начала.
+
+    Args:
+        file_path:  Путь к Excel файлу с аварийными работами
+        sheet_name: Лист (по умолчанию первый)
+
+    Returns:
+        Статистика {"works": 5, "requirements": 50, "errors": 0}
+    """
+    logger.info("Импорт АВАРИЙНЫХ работ из: %s", file_path)
+
+    # Формат файла такой же, как обычные потребности — используем тот же маппинг
+    df = _read_excel(file_path, sheet_name)
+    df = _rename_columns(df, REQUIREMENTS_COLUMN_MAP)
+
+    stats = {"works": 0, "requirements": 0, "errors": 0}
+    errors: list[str] = []
+
+    with get_session() as session:
+        work_repo = WorkRepository(session)
+        material_repo = MaterialRepository(session)
+        req_repo = RequirementRepository(session)
+
+        existing_works = work_repo.get_kod_map()
+        existing_materials = material_repo.get_id_map()
+        new_works_in_session: set[str] = set()
+        new_materials_in_session: set[str] = set()
+
+        for row_num, row in df.iterrows():
+            row_dict = row.to_dict()
+
+            try:
+                validated = WorkImportRow(**row_dict)
+            except ValidationError as e:
+                error_msg = f"Строка {row_num + 2}: {e.errors()[0]['msg']}"
+                errors.append(error_msg)
+                stats["errors"] += 1
+                logger.warning("Ошибка валидации аварийной работы | %s", error_msg)
+                continue
+
+            # Создаём работу с флагом is_emergency=True (это ключевое отличие!)
+            if (validated.kod_raboty not in existing_works
+                    and validated.kod_raboty not in new_works_in_session):
+                work_repo.get_or_create(
+                    kod_raboty=validated.kod_raboty,
+                    tip_raboty=validated.tip_raboty,
+                    filial=validated.filial,
+                    podrazdelenie=validated.podrazdelenie,
+                    centr_zatrat=validated.centr_zatrat,
+                    zavod=validated.zavod,
+                    data_nachala=validated.data_nachala,
+                    data_okonchaniya=validated.data_okonchaniya,
+                    prioritet=validated.prioritet,
+                    status=validated.status,
+                    is_emergency=True,  # ← ВОТ ЕДИНСТВЕННОЕ ОТЛИЧИЕ ОТ ОБЫЧНОГО ИМПОРТА
+                )
+                new_works_in_session.add(validated.kod_raboty)
+                stats["works"] += 1
+            else:
+                # Если работа уже существует — помечаем как аварийную
+                work_repo.get_or_create(
+                    kod_raboty=validated.kod_raboty,
+                    is_emergency=True,  # get_or_create обновит флаг у существующей работы
+                )
+
+            if (validated.sys_nomer_materiala not in existing_materials
+                    and validated.sys_nomer_materiala not in new_materials_in_session):
+                material_repo.get_or_create(
+                    sys_nomer=validated.sys_nomer_materiala,
+                    naimenovanie=validated.naimenovanie_materiala,
+                    ed_izm=validated.ed_izm,
+                )
+                new_materials_in_session.add(validated.sys_nomer_materiala)
+
+            session.flush()
+
+            work = work_repo.get_by_kod(validated.kod_raboty)
+            material = material_repo.get_by_sys_nomer(validated.sys_nomer_materiala)
+
+            if work and material:
+                req_repo.upsert(
+                    work_id=work.id,
+                    material_id=material.id,
+                    potrebnost=validated.potrebnost,
+                    prognosnaya_tsena=validated.prognosnaya_tsena,
+                )
+                stats["requirements"] += 1
+
+        logger.info(
+            "Импорт АВАРИЙНЫХ работ завершён: работ=%d, потребностей=%d, ошибок=%d",
+            stats["works"], stats["requirements"], stats["errors"],
+        )
+
+    if errors:
+        logger.warning("Ошибки при импорте аварийных:\n%s", "\n".join(errors[:10]))
+
+    return stats
+
+
+# =============================================================================
+# Импорт складских остатков (Слой 3)
+# =============================================================================
+
+def import_stock(file_path: Path, sheet_name: int | str = 0) -> dict[str, int]:
     """
     Импортировать складские остатки (партии материалов) из Excel.
 
     Перед импортом удаляем все существующие партии и загружаем заново.
-    Это гарантирует, что остатки соответствуют актуальному снимку из SAP.
+    Это «снимок состояния склада на текущий момент»: всегда актуальные данные.
+
+    ВНИМАНИЕ: Существующие партии будут УДАЛЕНЫ и заменены данными из файла!
 
     Args:
         file_path:  Путь к Excel файлу
         sheet_name: Лист (по умолчанию первый)
 
     Returns:
-        Статистика: {"warehouses": 10, "batches": 5000, "errors": 0}
+        Статистика {"warehouses": 10, "batches": 5000, "errors": 0}
     """
     df = _read_excel(file_path, sheet_name)
     df = _rename_columns(df, STOCK_COLUMN_MAP)
@@ -316,12 +517,12 @@ def import_stock(file_path: Path, sheet_name: str = 0) -> dict[str, int]:
     with get_session() as session:
         material_repo = MaterialRepository(session)
 
-        # Очищаем старые данные (остатки на складе = снимок текущего момента)
+        # Очищаем старые данные перед загрузкой нового снимка
         from sqlalchemy import delete
         session.execute(delete(StockBatch))
-        logger.info("Очищены старые складские остатки")
+        logger.info("Очищены старые складские остатки (партии)")
 
-        # Кэш складов и материалов чтобы не делать запрос на каждую строку
+        # Кэш складов — чтобы не делать запрос к БД для каждой партии
         warehouse_cache: dict[str, Warehouse] = {}
 
         for row_num, row in df.iterrows():
@@ -334,7 +535,7 @@ def import_stock(file_path: Path, sheet_name: str = 0) -> dict[str, int]:
                 stats["errors"] += 1
                 continue
 
-            # Склад
+            # Склад: получаем или создаём (кэшируем чтобы не дублировать)
             if validated.kod_sklada not in warehouse_cache:
                 wh = _get_or_create_warehouse(
                     session=session,
@@ -348,7 +549,7 @@ def import_stock(file_path: Path, sheet_name: str = 0) -> dict[str, int]:
             else:
                 wh = warehouse_cache[validated.kod_sklada]
 
-            # Материал
+            # Материал: создаём или обновляем в справочнике
             material = material_repo.get_or_create(
                 sys_nomer=validated.sys_nomer_materiala,
                 naimenovanie=validated.naimenovanie_materiala,
@@ -356,19 +557,20 @@ def import_stock(file_path: Path, sheet_name: str = 0) -> dict[str, int]:
                 gruppa=validated.gruppa_materiala,
             )
 
+            # Периодический flush для производительности
             if stats["batches"] % 1000 == 0:
-                session.flush()  # Периодически сбрасываем в БД
+                session.flush()
+            session.flush()  # Нужен id материала для создания партии
 
-            material_after_flush = material
-            session.flush()
-
-            # Партия
+            # Создаём партию.
+            # dostupno = kolichestvo: изначально весь материал доступен.
+            # Алгоритм распределения будет уменьшать dostupno.
             batch = StockBatch(
                 warehouse_id=wh.id,
-                material_id=material_after_flush.id,
+                material_id=material.id,
                 nomer_partii=validated.nomer_partii,
                 kolichestvo=validated.kolichestvo,
-                dostupno=validated.kolichestvo,  # Изначально всё доступно
+                dostupno=validated.kolichestvo,  # Изначально весь остаток доступен
                 stoimost_za_ed=validated.stoimost_za_ed,
                 data_postupleniya=validated.data_postupleniya,
             )
@@ -384,21 +586,28 @@ def import_stock(file_path: Path, sheet_name: str = 0) -> dict[str, int]:
 
 
 # =============================================================================
-# Импорт поставок
+# Импорт поставок (Слой 4)
 # =============================================================================
 
-def import_supplies(file_path: Path, sheet_name: str = 0) -> dict[str, int]:
+def import_supplies(file_path: Path, sheet_name: int | str = 0) -> dict[str, int]:
     """
     Импортировать поставки (материалы в пути) из Excel.
 
-    Аналогично остаткам — очищаем и загружаем заново.
+    Поставки — это заказанные, но ещё не поступившие материалы.
+    Они привязаны к ФИЛИАЛУ (не к заводу): алгоритм сопоставляет
+    филиал поставки с филиалом работы.
+
+    Если несколько строк Excel относятся к одному договору — группируем их
+    в одну запись Supply с несколькими строками SupplyLine.
+
+    ВНИМАНИЕ: Существующие поставки будут УДАЛЕНЫ и заменены!
 
     Args:
         file_path:  Путь к Excel файлу
-        sheet_name: Лист (по умолчанию первый)
+        sheet_name: Лист
 
     Returns:
-        Статистика: {"supplies": 200, "lines": 800, "errors": 0}
+        Статистика {"supplies": 200, "lines": 800, "errors": 0}
     """
     df = _read_excel(file_path, sheet_name)
     df = _rename_columns(df, SUPPLY_COLUMN_MAP)
@@ -408,15 +617,14 @@ def import_supplies(file_path: Path, sheet_name: str = 0) -> dict[str, int]:
     with get_session() as session:
         material_repo = MaterialRepository(session)
 
-        # Очищаем старые поставки
+        # Очищаем старые данные: сначала строки (из-за FK), потом заголовки
         from sqlalchemy import delete
         session.execute(delete(SupplyLine))
         session.execute(delete(Supply))
         logger.info("Очищены старые поставки")
 
-        # Группируем по договору — одна поставка = один договор
-        # Для Excel без группировки создаём отдельную "поставку" на каждый договор
-        supply_cache: dict[str, Supply] = {}
+        # Кэши для предотвращения дублей в текущей сессии
+        supply_cache: dict[str, Supply] = {}     # {ключ_договора: Supply}
         warehouse_cache: dict[str, Warehouse] = {}
 
         for row_num, row in df.iterrows():
@@ -429,7 +637,8 @@ def import_supplies(file_path: Path, sheet_name: str = 0) -> dict[str, int]:
                 stats["errors"] += 1
                 continue
 
-            # Ключ для группировки поставок (договор + склад + дата)
+            # Уникальный ключ для группировки: договор + склад + дата
+            # Одна поставка (Supply) = один такой ключ
             dogovor_key = (
                 f"{validated.dogovor or 'no_contract'}"
                 f"_{validated.kod_sklada or 'no_wh'}"
@@ -450,25 +659,25 @@ def import_supplies(file_path: Path, sheet_name: str = 0) -> dict[str, int]:
                     warehouse_cache[validated.kod_sklada] = wh
                 warehouse_id = warehouse_cache[validated.kod_sklada].id
 
-            # Поставка (создаём один раз на договор)
+            # Создаём запись Supply один раз на договор
             if dogovor_key not in supply_cache:
                 supply = Supply(
                     dogovor=validated.dogovor,
                     postavshchik=validated.postavshchik,
                     warehouse_id=warehouse_id,
-                    filial=validated.filial,
+                    filial=validated.filial,   # ← Ключевое поле для сопоставления с работой
                     zavod=validated.zavod,
                     data_postavki=validated.data_postavki,
                     status=validated.status,
                 )
                 session.add(supply)
-                session.flush()
+                session.flush()  # Нужен id для строк поставки
                 supply_cache[dogovor_key] = supply
                 stats["supplies"] += 1
             else:
                 supply = supply_cache[dogovor_key]
 
-            # Материал
+            # Материал в справочнике
             material = material_repo.get_or_create(
                 sys_nomer=validated.sys_nomer_materiala,
                 naimenovanie=validated.naimenovanie_materiala,
@@ -476,12 +685,12 @@ def import_supplies(file_path: Path, sheet_name: str = 0) -> dict[str, int]:
             )
             session.flush()
 
-            # Строка поставки
+            # Строка поставки (конкретный материал в поставке)
             line = SupplyLine(
                 supply_id=supply.id,
                 material_id=material.id,
                 kolichestvo=validated.kolichestvo,
-                dostupno=validated.kolichestvo,  # Изначально всё доступно
+                dostupno=validated.kolichestvo,  # Изначально весь объём доступен
                 stoimost_za_ed=validated.stoimost_za_ed,
             )
             session.add(line)
@@ -490,6 +699,238 @@ def import_supplies(file_path: Path, sheet_name: str = 0) -> dict[str, int]:
         logger.info(
             "Импорт поставок завершён: поставок=%d, строк=%d, ошибок=%d",
             stats["supplies"], stats["lines"], stats["errors"],
+        )
+
+    return stats
+
+
+# =============================================================================
+# Импорт фактических списаний (Слой 1 распределения)
+# =============================================================================
+
+def import_writeoffs(file_path: Path, sheet_name: int | str = 0) -> dict[str, int]:
+    """
+    Импортировать фактические списания материалов на работы из Excel.
+
+    Что это такое?
+        Данные о материалах, которые уже физически списаны на работу в SAP.
+        Это самый надёжный источник: документально подтверждён.
+
+    Логика импорта:
+        1. Очищаем старые записи (полная замена снимком)
+        2. Для каждой строки: ищем работу и материал в БД, создаём WriteOff.
+           ВНИМАНИЕ: Если работа или материал не найдены — пропускаем строку.
+           Сначала нужно импортировать потребности (import_requirements)!
+
+    Зачем нужна очистка?
+        Файл списаний — это выгрузка из SAP на конкретную дату.
+        При обновлении данных просто загружаем новый файл — старые удаляются.
+
+    Args:
+        file_path:  Путь к Excel файлу
+        sheet_name: Лист
+
+    Returns:
+        Статистика {"writeoffs": 500, "errors": 5, "skipped": 10}
+    """
+    df = _read_excel(file_path, sheet_name)
+    df = _rename_columns(df, WRITEOFF_COLUMN_MAP)
+
+    stats = {"writeoffs": 0, "errors": 0, "skipped": 0}
+
+    with get_session() as session:
+        work_repo = WorkRepository(session)
+        material_repo = MaterialRepository(session)
+
+        # Очищаем старые записи перед загрузкой нового снимка
+        from sqlalchemy import delete
+        session.execute(delete(WriteOff))
+        logger.info("Очищены старые записи списаний")
+
+        # Предзагружаем словари работ и материалов для быстрого поиска
+        work_kod_map = work_repo.get_kod_map()           # {kod_raboty: id}
+        material_nomer_map = material_repo.get_id_map()  # {sys_nomer: id}
+
+        for row_num, row in df.iterrows():
+            row_dict = row.to_dict()
+
+            try:
+                validated = WriteOffImportRow(**row_dict)
+            except ValidationError as e:
+                logger.warning("Строка %d: %s", row_num + 2, e.errors()[0]["msg"])
+                stats["errors"] += 1
+                continue
+
+            # Ищем ID работы в словаре (O(1))
+            work_id = work_kod_map.get(validated.kod_raboty)
+            if work_id is None:
+                # Работа не найдена — пропускаем (сначала надо импортировать потребности)
+                logger.warning(
+                    "Строка %d: Работа '%s' не найдена в БД. Импортируйте потребности сначала.",
+                    row_num + 2, validated.kod_raboty,
+                )
+                stats["skipped"] += 1
+                continue
+
+            # Ищем ID материала
+            material_id = material_nomer_map.get(validated.sys_nomer_materiala)
+            if material_id is None:
+                # Материала нет в справочнике — создаём его (если есть наименование)
+                material = material_repo.get_or_create(
+                    sys_nomer=validated.sys_nomer_materiala,
+                    naimenovanie=validated.naimenovanie_materiala,
+                    ed_izm=validated.ed_izm,
+                )
+                session.flush()
+                material_id = material.id
+                # Обновляем локальный словарь чтобы не создавать дубли
+                material_nomer_map[validated.sys_nomer_materiala] = material_id
+
+            # Рассчитываем сумму если не передана (qty × price)
+            from decimal import Decimal
+            summa = validated.summa
+            if summa == Decimal("0") and validated.stoimost_za_ed > 0:
+                summa = (validated.kolichestvo * validated.stoimost_za_ed).quantize(Decimal("0.01"))
+
+            # Создаём запись о списании
+            writeoff = WriteOff(
+                work_id=work_id,
+                material_id=material_id,
+                kolichestvo=validated.kolichestvo,
+                stoimost_za_ed=validated.stoimost_za_ed,
+                summa=summa,
+                nomer_dokumenta=validated.nomer_dokumenta,
+                data_spisaniya=validated.data_spisaniya,
+            )
+            session.add(writeoff)
+            stats["writeoffs"] += 1
+
+            # Периодический flush для производительности
+            if stats["writeoffs"] % 500 == 0:
+                session.flush()
+
+        logger.info(
+            "Импорт списаний завершён: записей=%d, ошибок=%d, пропущено=%d",
+            stats["writeoffs"], stats["errors"], stats["skipped"],
+        )
+
+    return stats
+
+
+# =============================================================================
+# Импорт «Выдано не списано» (Слой 2 распределения)
+# =============================================================================
+
+def import_issued_not_written_off(file_path: Path, sheet_name: int | str = 0) -> dict[str, int]:
+    """
+    Импортировать данные «Выдано не списано» из Excel.
+
+    Что это такое?
+        Материалы, которые уже выданы со склада на объект (бригада получила),
+        но документ списания в SAP ещё не проведён.
+        Это «серая зона» между выдачей и официальным списанием.
+
+    Особенности:
+        - Поле «Код склада» — только информативное, остатки склада НЕ изменяются
+        - При обработке алгоритмом этот слой уменьшает remaining,
+          но НЕ записывает движение по складу (материал уже физически ушёл)
+
+    Args:
+        file_path:  Путь к Excel файлу
+        sheet_name: Лист
+
+    Returns:
+        Статистика {"issued": 200, "errors": 5, "skipped": 3}
+    """
+    df = _read_excel(file_path, sheet_name)
+    df = _rename_columns(df, ISSUED_COLUMN_MAP)
+
+    stats = {"issued": 0, "errors": 0, "skipped": 0}
+
+    with get_session() as session:
+        work_repo = WorkRepository(session)
+        material_repo = MaterialRepository(session)
+
+        # Очищаем старые данные
+        from sqlalchemy import delete
+        session.execute(delete(IssuedNotWrittenOff))
+        logger.info("Очищены старые записи 'Выдано не списано'")
+
+        work_kod_map = work_repo.get_kod_map()
+        material_nomer_map = material_repo.get_id_map()
+        warehouse_cache: dict[str, Warehouse] = {}
+
+        for row_num, row in df.iterrows():
+            row_dict = row.to_dict()
+
+            try:
+                validated = IssuedNotWrittenOffImportRow(**row_dict)
+            except ValidationError as e:
+                logger.warning("Строка %d: %s", row_num + 2, e.errors()[0]["msg"])
+                stats["errors"] += 1
+                continue
+
+            # Ищем работу
+            work_id = work_kod_map.get(validated.kod_raboty)
+            if work_id is None:
+                logger.warning(
+                    "Строка %d: Работа '%s' не найдена. Сначала импортируйте потребности.",
+                    row_num + 2, validated.kod_raboty,
+                )
+                stats["skipped"] += 1
+                continue
+
+            # Ищем или создаём материал
+            material_id = material_nomer_map.get(validated.sys_nomer_materiala)
+            if material_id is None:
+                material = material_repo.get_or_create(
+                    sys_nomer=validated.sys_nomer_materiala,
+                    naimenovanie=validated.naimenovanie_materiala,
+                    ed_izm=validated.ed_izm,
+                )
+                session.flush()
+                material_id = material.id
+                material_nomer_map[validated.sys_nomer_materiala] = material_id
+
+            # Склад (если указан) — только для информации
+            warehouse_id = None
+            if validated.kod_sklada:
+                if validated.kod_sklada not in warehouse_cache:
+                    wh = _get_or_create_warehouse(
+                        session=session,
+                        kod_sklada=validated.kod_sklada,
+                        tip_sklada=None,
+                        filial=None,
+                        zavod=None,
+                    )
+                    warehouse_cache[validated.kod_sklada] = wh
+                warehouse_id = warehouse_cache[validated.kod_sklada].id
+
+            # Рассчитываем сумму если не передана
+            from decimal import Decimal
+            summa = validated.summa
+            if summa == Decimal("0") and validated.stoimost_za_ed > 0:
+                summa = (validated.kolichestvo * validated.stoimost_za_ed).quantize(Decimal("0.01"))
+
+            # Создаём запись «Выдано не списано»
+            issued = IssuedNotWrittenOff(
+                work_id=work_id,
+                material_id=material_id,
+                warehouse_id=warehouse_id,  # Информативно, остатки не трогаем
+                kolichestvo=validated.kolichestvo,
+                stoimost_za_ed=validated.stoimost_za_ed,
+                summa=summa,
+                data_vydachi=validated.data_vydachi,
+            )
+            session.add(issued)
+            stats["issued"] += 1
+
+            if stats["issued"] % 500 == 0:
+                session.flush()
+
+        logger.info(
+            "Импорт 'Выдано не списано' завершён: записей=%d, ошибок=%d, пропущено=%d",
+            stats["issued"], stats["errors"], stats["skipped"],
         )
 
     return stats
