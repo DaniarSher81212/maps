@@ -41,6 +41,10 @@ logs/*.txt
 data/*.xlsx
 data/*.xls
 data/*.csv
+# Результаты экспорта (генерируются при работе)
+data/exports/
+# Тестовые Excel-файлы (генерируются скриптом generate_test_scenarios.py)
+data/test/
 # Шаблоны Excel (пустые) — коммитим
 !data/templates/*.xlsx
 
