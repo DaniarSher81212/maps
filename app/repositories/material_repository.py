@@ -1,28 +1,48 @@
 """
-app/repositories/material_repository.py — Репозиторий материалов и складских остатков
+app/repositories/material_repository.py — Репозитории материалов, складов и поставок
 
 Содержит специализированные запросы для:
   - Справочника материалов (Material)
   - Складских партий (StockBatch)
   - Строк поставок (SupplyLine)
+  - Фактических списаний (WriteOff) — Слой 1
+  - Выдано не списано (IssuedNotWrittenOff) — Слой 2
+
+Каждый репозиторий — это «умный» доступ к одной таблице.
+Бизнес-логика (engine.py) вызывает методы репозитория и получает готовые объекты,
+не вникая в детали SQL.
 """
 
 from decimal import Decimal
 from typing import Optional
 
-from sqlalchemy import select
+from sqlalchemy import select, update
 from sqlalchemy.orm import Session, joinedload
 
 from app.core.logging_config import get_logger
-from app.db.models import Material, StockBatch, Supply, SupplyLine, Warehouse
+from app.db.models import (
+    IssuedNotWrittenOff,
+    Material,
+    StockBatch,
+    Supply,
+    SupplyLine,
+    Warehouse,
+    WriteOff,
+)
 from app.repositories.base import BaseRepository
 
 logger = get_logger(__name__)
 
 
+# =============================================================================
+# Репозиторий справочника материалов
+# =============================================================================
+
 class MaterialRepository(BaseRepository[Material]):
     """
     Репозиторий для работы со справочником материалов.
+
+    Материал в MAPS — это позиция номенклатуры SAP MM с уникальным sys_nomer.
     """
 
     def __init__(self, session: Session) -> None:
@@ -33,26 +53,30 @@ class MaterialRepository(BaseRepository[Material]):
         Найти материал по системному номеру SAP.
 
         Args:
-            sys_nomer: Системный номер материала (например "000000000010012345")
+            sys_nomer: Системный номер, например "000000000010012345"
 
         Returns:
-            Material или None
+            Объект Material или None
         """
         stmt = select(Material).where(Material.sys_nomer == sys_nomer)
         return self.session.scalar(stmt)
 
-    def get_or_create(self, sys_nomer: str, naimenovanie: Optional[str] = None,
-                      ed_izm: Optional[str] = None, gruppa: Optional[str] = None) -> Material:
+    def get_or_create(
+        self,
+        sys_nomer: str,
+        naimenovanie: Optional[str] = None,
+        ed_izm: Optional[str] = None,
+        gruppa: Optional[str] = None,
+    ) -> Material:
         """
         Получить материал или создать если не существует.
 
-        Этот метод часто используется при импорте:
-        мы не знаем заранее, есть ли материал в БД,
-        поэтому проверяем и создаём при необходимости.
+        Используется при импорте любых Excel-файлов: если материал встречается
+        впервые — создаём, если уже есть — обновляем наименование (если стало известно).
 
         Args:
-            sys_nomer:    Системный номер
-            naimenovanie: Наименование (обновляется если уже есть)
+            sys_nomer:    Системный номер (ключ поиска)
+            naimenovanie: Наименование (обновляется если поле было пустым)
             ed_izm:       Единица измерения
             gruppa:       Группа материала
 
@@ -61,7 +85,7 @@ class MaterialRepository(BaseRepository[Material]):
         """
         material = self.get_by_sys_nomer(sys_nomer)
         if material is None:
-            # Материала нет — создаём
+            # Материала нет в БД — создаём новую запись
             material = Material(
                 sys_nomer=sys_nomer,
                 naimenovanie=naimenovanie,
@@ -71,7 +95,8 @@ class MaterialRepository(BaseRepository[Material]):
             self.add(material)
             logger.debug("Создан новый материал: %s", sys_nomer)
         else:
-            # Материал есть — обновляем наименование если оно стало известно
+            # Материал уже есть — дополняем поля, если они были пустыми
+            # (не заменяем существующие данные, только добавляем недостающие)
             if naimenovanie and not material.naimenovanie:
                 material.naimenovanie = naimenovanie
             if ed_izm and not material.ed_izm:
@@ -82,21 +107,24 @@ class MaterialRepository(BaseRepository[Material]):
         """
         Вернуть словарь {sys_nomer: id} для всех материалов.
 
-        Используется для быстрого поиска ID по номеру SAP
-        без обращения к БД на каждую строку (оптимизация для импорта).
-
-        Например:
-            id_map = material_repo.get_id_map()
-            material_id = id_map["000000000010012345"]  # O(1) поиск
+        Используется при импорте для быстрого поиска ID по номеру SAP (O(1))
+        вместо SELECT-запроса для каждой строки Excel.
         """
         stmt = select(Material.sys_nomer, Material.id)
         rows = self.session.execute(stmt).all()
         return {row.sys_nomer: row.id for row in rows}
 
 
+# =============================================================================
+# Репозиторий складских партий (Слой 3 распределения)
+# =============================================================================
+
 class StockBatchRepository(BaseRepository[StockBatch]):
     """
     Репозиторий для работы со складскими партиями.
+
+    Каждая партия — это конкретный приход материала на склад с ценой и датой.
+    При распределении используется FIFO: более старые партии расходуются первыми.
     """
 
     def __init__(self, session: Session) -> None:
@@ -110,26 +138,27 @@ class StockBatchRepository(BaseRepository[StockBatch]):
         """
         Получить все доступные партии для материала, отсортированные по FIFO.
 
-        FIFO (First In First Out) = сначала используем самые старые партии.
-        Сортировка: data_postupleniya ASC (старые даты — первые).
+        FIFO (First In First Out) = самые старые партии — первыми.
+        Логика: сначала расходуем то, что дольше лежит на складе.
 
         Args:
             material_id: ID материала в БД
-            min_qty:     Минимальное доступное количество (фильтруем пустые)
+            min_qty:     Минимальное доступное количество (исключаем пустые партии)
 
         Returns:
-            Список партий, отсортированных от старой к новой
+            Список партий, отсортированных от старой к новой по дате поступления
         """
         stmt = (
             select(StockBatch)
-            .options(joinedload(StockBatch.warehouse))  # Загружаем склад сразу (join)
+            # joinedload — загружаем связанный склад (Warehouse) ОДНИМ запросом, а не N+1
+            .options(joinedload(StockBatch.warehouse))
             .where(
                 StockBatch.material_id == material_id,
-                StockBatch.dostupno >= min_qty,  # Только с ненулевым остатком
+                StockBatch.dostupno >= min_qty,  # Только ненулевые остатки
             )
             .order_by(
                 StockBatch.data_postupleniya.asc().nulls_last(),  # FIFO: старые первые
-                StockBatch.id.asc(),  # При одинаковой дате — по порядку добавления
+                StockBatch.id.asc(),  # При одинаковой дате — по порядку создания
             )
         )
         return list(self.session.scalars(stmt).all())
@@ -142,23 +171,31 @@ class StockBatchRepository(BaseRepository[StockBatch]):
         min_qty: Decimal = Decimal("0.0001"),
     ) -> dict[str, list[StockBatch]]:
         """
-        Получить партии, сгруппированные по приоритету склада.
+        Получить партии, разделённые на три группы по приоритету склада.
 
-        Согласно ТЗ, приоритеты:
-            1 — склады того же завода (zavod совпадает с заводом работы)
-            2 — склады того же филиала (но другого завода)
-            3 — все остальные склады
+        Приоритеты складов согласно ТЗ:
+            "zavod"   — Склад того же завода, что и работа (высший приоритет)
+                        Материал из «своего» завода — оптимально по логистике
+            "filial"  — Склад того же филиала, другого завода (средний)
+                        Можно взять внутри филиала
+            "prochee" — Склады ДРУГИХ филиалов (для анализа, НЕ распределяем)
+                        Показываем как «возможное» — требует согласования переброски
+
+        Зачем три группы?
+            Алгоритм сначала полностью использует "zavod"-партии,
+            затем "filial"-партии, а "prochee" только показывает в отчёте
+            как возможный резерв без фактического списания.
 
         Args:
             material_id: ID материала
-            zavod:       Код завода работы (может быть None)
+            zavod:       Код завода работы (может быть None — у работы нет завода)
             filial:      Код филиала работы (может быть None)
             min_qty:     Минимальное доступное количество
 
         Returns:
-            Словарь {"zavod": [...], "filial": [...], "prochee": [...]}
+            Словарь с тремя ключами: {"zavod": [...], "filial": [...], "prochee": [...]}
         """
-        # Получаем все доступные партии с данными склада
+        # Получаем ВСЕ доступные партии для этого материала (один запрос к БД)
         stmt = (
             select(StockBatch)
             .join(Warehouse, StockBatch.warehouse_id == Warehouse.id)
@@ -167,45 +204,77 @@ class StockBatchRepository(BaseRepository[StockBatch]):
                 StockBatch.dostupno >= min_qty,
             )
             .order_by(
+                # Единая FIFO-сортировка по всем группам
                 StockBatch.data_postupleniya.asc().nulls_last(),
                 StockBatch.id.asc(),
             )
         )
         all_batches = list(self.session.scalars(stmt).all())
 
-        # Разбиваем на три группы по приоритету
+        # Разделяем на три группы в Python (не в SQL — проще читать, одинаково быстро)
         result: dict[str, list[StockBatch]] = {
-            "zavod": [],    # Приоритет 1: тот же завод
-            "filial": [],   # Приоритет 2: тот же филиал, другой завод
-            "prochee": [],  # Приоритет 3: остальные
+            "zavod": [],    # Тот же завод — высший приоритет
+            "filial": [],   # Тот же филиал, другой завод — средний приоритет
+            "prochee": [],  # Другой филиал — только для анализа
         }
 
         for batch in all_batches:
             wh = batch.warehouse
             if wh is None:
+                # Партия без склада (нет связи) — отправляем в "prochee"
                 result["prochee"].append(batch)
                 continue
 
             if zavod and wh.zavod == zavod:
-                # Склад в том же заводе — высший приоритет
+                # Склад в том же заводе → группа "zavod"
                 result["zavod"].append(batch)
             elif filial and wh.filial == filial:
-                # Склад в том же филиале — средний приоритет
+                # Склад в том же филиале (но другой завод) → группа "filial"
                 result["filial"].append(batch)
             else:
-                # Остальные склады
+                # Всё остальное (другой филиал) → "prochee"
                 result["prochee"].append(batch)
 
         return result
+
+    def reset_dostupno(self) -> None:
+        """
+        Восстановить доступное количество всех партий до полного остатка.
+
+        Вызывается в начале каждого запуска AllocationEngine.run() — ПОСЛЕ
+        сброса потребностей, но ДО основного цикла распределения.
+
+        Зачем нужен сброс?
+            Алгоритм распределения уменьшает dostupno у партий в процессе
+            работы и записывает эти изменения в БД в конце (_update_availability_in_db).
+            Если запустить распределение повторно без сброса — склад покажется пустым,
+            потому что dostupno от предыдущего запуска остался нулевым.
+
+        Принцип: dostupno = kolichestvo означает «весь материал снова доступен».
+        Это НЕ отменяет реальные выдачи — kolichestvo остаётся неизменным
+        и отражает реальный физический остаток на складе.
+        """
+        stmt = update(StockBatch).values(dostupno=StockBatch.kolichestvo)
+        self.session.execute(stmt)
+        logger.info("Остатки партий сброшены: dostupno = kolichestvo")
 
     def bulk_create(self, batches: list[StockBatch]) -> None:
         """Массовое добавление партий (для импорта Excel)."""
         self.session.add_all(batches)
 
 
+# =============================================================================
+# Репозиторий поставок (Слой 4 распределения)
+# =============================================================================
+
 class SupplyRepository(BaseRepository[Supply]):
     """
-    Репозиторий для работы с поставками.
+    Репозиторий для работы с поставками («материалы в пути»).
+
+    Важный нюанс: поставки в MAPS привязаны к ФИЛИАЛУ, не к заводу.
+    При распределении из поставок мы проверяем:
+        supply.filial == work.filial (филиал поставки = филиал работы)
+    Внутри завода поставки не разделяются — это особенность бизнес-процесса.
     """
 
     def __init__(self, session: Session) -> None:
@@ -214,38 +283,157 @@ class SupplyRepository(BaseRepository[Supply]):
     def get_available_lines_for_material(
         self,
         material_id: int,
+        filial: Optional[str] = None,          # НОВЫЙ параметр: фильтр по филиалу
         exclude_statuses: Optional[list[str]] = None,
         min_qty: Decimal = Decimal("0.0001"),
     ) -> list[SupplyLine]:
         """
-        Получить строки поставок для материала, отсортированные по дате поставки.
+        Получить строки поставок для материала, подходящие для данной работы.
 
-        Используется на втором этапе распределения — после склада.
-        Берём поставки с ближайшей датой поставки (они придут раньше).
+        Ключевое правило: поставки идут на ФИЛИАЛ, не на завод.
+        Поэтому мы фильтруем по filial работы, а не по zavod.
+
+        Сортировка: ближайшие даты поставки — первыми (логично: чем раньше придёт,
+        тем надёжнее покрытие).
 
         Args:
-            material_id:      ID материала
-            exclude_statuses: Статусы поставок, которые НЕ берём (например "cancelled")
-            min_qty:          Минимальное доступное количество
+            material_id:      ID материала в БД
+            filial:           Филиал работы — фильтруем поставки только этого филиала.
+                              Если None — берём все (для случаев без привязки к филиалу).
+            exclude_statuses: Статусы поставок, которые НЕ берём.
+                              По умолчанию исключаем "cancelled" и "arrived"
+                              ("arrived" = уже прибыло, должно быть в складских остатках)
+            min_qty:          Минимальный доступный остаток
 
         Returns:
-            Строки поставок, отсортированные по дате (ближайшие — первые)
+            Список строк поставок, отсортированных по дате (ближайшие — первые)
         """
+        # Если не передан список исключений — используем дефолтный
         if exclude_statuses is None:
             exclude_statuses = ["cancelled", "arrived"]
 
+        # Строим запрос шаг за шагом для наглядности
         stmt = (
             select(SupplyLine)
-            .join(Supply, SupplyLine.supply_id == Supply.id)
+            .join(Supply, SupplyLine.supply_id == Supply.id)  # Соединяем строку с заголовком поставки
             .where(
                 SupplyLine.material_id == material_id,
                 SupplyLine.dostupno >= min_qty,
-                Supply.status.notin_(exclude_statuses),
+                Supply.status.notin_(exclude_statuses),  # Исключаем отменённые и прибывшие
             )
             .order_by(
                 Supply.data_postavki.asc().nulls_last(),  # Ближайшие поставки первые
                 SupplyLine.id.asc(),
             )
+            # Загружаем Supply вместе (нужен для доступа к dogovor, postavshchik, filial)
             .options(joinedload(SupplyLine.supply))
         )
+
+        # ── Фильтр по филиалу (КЛЮЧЕВОЕ БИЗНЕС-ПРАВИЛО) ──
+        # Поставки идут на филиал, не на завод.
+        # Работа получает только те поставки, которые адресованы её филиалу.
+        if filial:
+            # Добавляем условие: filial поставки = filial работы
+            stmt = stmt.where(Supply.filial == filial)
+
         return list(self.session.scalars(stmt).all())
+
+    def reset_dostupno(self) -> None:
+        """
+        Восстановить доступное количество всех строк поставок до полного объёма.
+
+        Аналогично StockBatchRepository.reset_dostupno() — вызывается
+        в начале каждого запуска AllocationEngine перед основным циклом.
+
+        Зачем нужен сброс?
+            Алгоритм резервирует количество из строк поставок (уменьшает dostupno).
+            Без сброса повторный запуск видит «исчерпанные» поставки.
+        """
+        stmt = update(SupplyLine).values(dostupno=SupplyLine.kolichestvo)
+        self.session.execute(stmt)
+        logger.info("Остатки строк поставок сброшены: dostupno = kolichestvo")
+
+
+# =============================================================================
+# Репозиторий фактических списаний (Слой 1 распределения)
+# =============================================================================
+
+class WriteOffRepository(BaseRepository[WriteOff]):
+    """
+    Репозиторий для работы с фактическими списаниями (WriteOff).
+
+    WriteOff — это подтверждённые документом расходы материала на работу.
+    Это первый и самый надёжный слой покрытия потребности.
+    """
+
+    def __init__(self, session: Session) -> None:
+        super().__init__(session, WriteOff)
+
+    def get_all_grouped_by_work_material(
+        self,
+    ) -> dict[tuple[int, int], list[WriteOff]]:
+        """
+        Загрузить все записи списаний и сгруппировать по (work_id, material_id).
+
+        Зачем загружать всё сразу в память?
+            В алгоритме мы обрабатываем тысячи потребностей.
+            Если делать SELECT для каждой потребности — N+1 запросов → медленно.
+            Один SELECT всей таблицы + группировка в Python — быстрее.
+
+        Returns:
+            Словарь {(work_id, material_id): [WriteOff, ...]}
+            Ключ — пара идентификаторов, значение — список записей.
+        """
+        # Загружаем все записи одним запросом
+        stmt = select(WriteOff)
+        all_writeoffs = list(self.session.scalars(stmt).all())
+
+        # Группируем в словарь для быстрого доступа O(1) по ключу
+        result: dict[tuple[int, int], list[WriteOff]] = {}
+        for wo in all_writeoffs:
+            key = (wo.work_id, wo.material_id)
+            # setdefault создаёт пустой список если ключа ещё нет
+            result.setdefault(key, []).append(wo)
+
+        logger.debug("Загружено записей списания: %d (по %d уникальным парам работа+материал)",
+                     len(all_writeoffs), len(result))
+        return result
+
+
+# =============================================================================
+# Репозиторий «Выдано не списано» (Слой 2 распределения)
+# =============================================================================
+
+class IssuedNotWrittenOffRepository(BaseRepository[IssuedNotWrittenOff]):
+    """
+    Репозиторий для работы с «Выдано не списано» (IssuedNotWrittenOff).
+
+    Слой 2 распределения: материал выдан на объект, документ не оформлен.
+    Обрабатывается сразу после фактических списаний (Слой 1).
+    """
+
+    def __init__(self, session: Session) -> None:
+        super().__init__(session, IssuedNotWrittenOff)
+
+    def get_all_grouped_by_work_material(
+        self,
+    ) -> dict[tuple[int, int], list[IssuedNotWrittenOff]]:
+        """
+        Загрузить все записи «Выдано не списано» и сгруппировать по (work_id, material_id).
+
+        Аналогично WriteOffRepository — загружаем один раз для всего алгоритма.
+
+        Returns:
+            Словарь {(work_id, material_id): [IssuedNotWrittenOff, ...]}
+        """
+        stmt = select(IssuedNotWrittenOff)
+        all_issued = list(self.session.scalars(stmt).all())
+
+        result: dict[tuple[int, int], list[IssuedNotWrittenOff]] = {}
+        for item in all_issued:
+            key = (item.work_id, item.material_id)
+            result.setdefault(key, []).append(item)
+
+        logger.debug("Загружено записей 'выдано не списано': %d (по %d парам работа+материал)",
+                     len(all_issued), len(result))
+        return result

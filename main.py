@@ -3,37 +3,53 @@ main.py — Точка входа в систему MAPS (CLI)
 
 Что такое CLI?
     Command Line Interface — интерфейс командной строки.
-    Позволяет запускать функции системы из терминала командами.
+    Вместо кнопок и форм — команды в терминале.
+    Пример: maps allocate  — запускает распределение.
 
 Почему Typer?
-    Typer — современная библиотека для создания CLI команд на Python.
-    Преимущества перед argparse:
-      - Автоматические подсказки при вводе команд (Tab)
-      - Автоматическая генерация --help
+    Typer — современная Python-библиотека для CLI.
+    Преимущества:
+      - Автоматически генерирует --help для каждой команды
       - Типизация через аннотации Python
-      - Красивый вывод через Rich
+      - Красивый вывод через Rich (цвета, таблицы)
 
-Доступные команды:
-    maps init              — создать таблицы в PostgreSQL
-    maps import-requirements FILE  — импортировать потребности из Excel
-    maps import-stock FILE         — импортировать складские остатки
-    maps import-supplies FILE      — импортировать поставки
-    maps allocate                  — запустить распределение
-    maps export SESSION_ID         — экспортировать результаты в Excel
-    maps status                    — показать текущее состояние БД
+Полный список команд:
+    ─────────────────────────────────────────────────────────────
+    Инициализация:
+        maps init                 — создать таблицы в PostgreSQL
 
-Примеры использования:
+    Импорт данных (порядок важен!):
+        maps import-requirements FILE     — потребности (обычные работы)
+        maps import-emergency FILE        — аварийные работы (наивысший приоритет)
+        maps import-stock FILE            — складские остатки (партии)
+        maps import-supplies FILE         — поставки (материалы в пути)
+        maps import-writeoffs FILE        — фактические списания (Слой 1)
+        maps import-issued FILE           — выдано не списано (Слой 2)
+
+    Алгоритм:
+        maps allocate             — запустить распределение
+        maps export SESSION_ID    — экспортировать результаты в Excel
+
+    Утилиты:
+        maps status               — состояние базы данных
+    ─────────────────────────────────────────────────────────────
+
+Рекомендуемый порядок работы:
+    1. maps init
+    2. maps import-requirements data/requirements.xlsx
+    3. maps import-emergency data/emergency.xlsx        (если есть)
+    4. maps import-stock data/stock.xlsx
+    5. maps import-supplies data/supplies.xlsx          (если есть)
+    6. maps import-writeoffs data/writeoffs.xlsx        (если есть)
+    7. maps import-issued data/issued.xlsx              (если есть)
+    8. maps allocate
+    9. maps export <ID_сессии>
+
+Примеры:
     python main.py init
     python main.py import-requirements data/sample_requirements.xlsx
-    python main.py import-stock data/sample_stock.xlsx
-    python main.py import-supplies data/sample_supplies.xlsx
-    python main.py allocate
+    python main.py allocate --session "план_2026_06"
     python main.py export 20260523_143000_abc12
-    python main.py status
-
-    Или после установки пакета (pip install -e .):
-    maps init
-    maps allocate
 """
 
 from pathlib import Path
@@ -46,15 +62,18 @@ from rich.table import Table
 
 from app.core.config import settings
 
-# Создаём экземпляр приложения Typer
-# help= — текст который показывается в: maps --help
+# Создаём экземпляр Typer — это и есть наше CLI-приложение
 app = typer.Typer(
     name="maps",
-    help="MAPS — Material Allocation & Planning System\n\nСистема распределения материалов для СМР.",
-    add_completion=False,  # Отключаем автодополнение (можно включить позже)
+    help=(
+        "MAPS — Material Allocation & Planning System\n\n"
+        "Система автоматического распределения материалов для строительно-монтажных работ.\n\n"
+        "Порядок запуска: init → import-requirements → import-stock → allocate → export"
+    ),
+    add_completion=False,
 )
 
-# Rich Console — для красивого вывода в терминал
+# Rich Console — для красивого вывода с цветами и таблицами
 console = Console()
 
 
@@ -67,8 +86,9 @@ def init() -> None:
     """
     Инициализировать базу данных: создать все таблицы.
 
-    Вызывается один раз при первом запуске системы.
-    Безопасно вызывать повторно — существующие данные НЕ удаляются.
+    Выполняется ОДИН РАЗ при первом запуске системы.
+    Безопасно вызывать повторно: существующие данные НЕ удаляются
+    (таблицы создаются только если их нет).
 
     Пример:
         maps init
@@ -82,7 +102,6 @@ def init() -> None:
 
     from app.db.database import check_connection, create_all_tables
 
-    # Проверяем доступность БД
     with console.status("Проверяем подключение к PostgreSQL..."):
         if not check_connection():
             console.print("[red]✗ Не удалось подключиться к PostgreSQL![/red]")
@@ -97,17 +116,65 @@ def init() -> None:
 
     console.print("[green]✓ Подключение успешно[/green]")
 
-    # Создаём таблицы
     with console.status("Создаём таблицы..."):
         create_all_tables()
 
     console.print("[green]✓ Все таблицы созданы/проверены[/green]")
-    console.print("\nСистема готова к работе! Следующий шаг:")
-    console.print("  [cyan]maps import-requirements data/sample_requirements.xlsx[/cyan]")
+    console.print(
+        "\nСистема готова к работе! Следующий шаг:\n"
+        "  [cyan]maps import-requirements data/sample_requirements.xlsx[/cyan]"
+    )
+
+
+@app.command(name="reset-data")
+def reset_data() -> None:
+    """
+    Полный сброс всех данных БД (таблицы остаются, данные удаляются).
+
+    Используется для повторного запуска тестов без пересоздания схемы.
+    Порядок очистки учитывает FK-зависимости: сначала зависимые таблицы.
+
+    ВНИМАНИЕ: операция необратима — все загруженные данные будут удалены!
+
+    Пример:
+        maps reset-data
+    """
+    console.print("[bold yellow]Сброс всех данных БД...[/bold yellow]")
+
+    from app.db.database import get_session
+    from sqlalchemy import text
+
+    # Таблицы перечислены в порядке зависимостей:
+    # сначала таблицы, у которых нет зависящих от них других таблиц,
+    # затем родительские (orders matters due to FK).
+    tables = (
+        "stock_movements",
+        "allocation_results",
+        "deficit_records",
+        "requirements",
+        "writeoffs",
+        "issued_not_written_off",
+        "supply_lines",
+        "supplies",
+        "stock_batches",
+        "warehouses",
+        "works",
+        "materials",
+        "allocation_sessions",
+    )
+
+    with get_session() as session:
+        for table in tables:
+            session.execute(text(f"TRUNCATE {table} RESTART IDENTITY CASCADE"))
+        # Транзакция коммитится при выходе из get_session() (если нет исключений)
+
+    console.print("[green]✓ Все данные удалены, последовательности сброшены[/green]")
+    console.print("Теперь можно заново импортировать данные:")
+    console.print("  [cyan]maps import-requirements ...[/cyan]")
 
 
 # =============================================================================
-# Команды импорта
+# Команды импорта данных
 # =============================================================================
 
 @app.command(name="import-requirements")
@@ -116,10 +183,16 @@ def import_requirements_cmd(
     sheet: str = typer.Option("0", "--sheet", "-s", help="Имя или номер листа (по умолчанию первый)"),
 ) -> None:
     """
-    Импортировать потребности работ в материалах из Excel файла.
+    Импортировать потребности обычных работ в материалах из Excel.
 
-    Ожидаемые колонки в Excel:
-        Код работы, Системный номер, Потребность, Дата начала, Приоритет, ...
+    Формат файла (заголовки колонок):
+        Код работы, Системный номер, Потребность, Прогнозная цена,
+        Дата начала, Дата окончания, Приоритет, Филиал, Завод, ...
+
+    Прогнозная цена (колонка «Прогнозная цена»):
+        Цена за единицу из исходной заявки.
+        Используется для расчёта обеспечённости по стоимости
+        и стоимости «К закупу» в итоговом отчёте.
 
     Пример:
         maps import-requirements data/requirements.xlsx
@@ -141,8 +214,49 @@ def import_requirements_cmd(
             console.print(f"[red]✗ Ошибка импорта: {e}[/red]")
             raise typer.Exit(code=1)
 
-    # Красивая таблица со статистикой
     _print_import_stats("Потребности", stats)
+
+
+@app.command(name="import-emergency")
+def import_emergency_cmd(
+    file: Path = typer.Argument(..., help="Путь к Excel файлу с аварийными работами"),
+    sheet: str = typer.Option("0", "--sheet", "-s", help="Имя или номер листа"),
+) -> None:
+    """
+    Импортировать аварийные работы из отдельного Excel файла.
+
+    Что такое аварийные работы?
+        Аварии на оборудовании, нарушения безопасности, критичные инциденты.
+        Они получают наивысший приоритет в очереди распределения материалов —
+        ПЕРЕД всеми обычными работами, вне зависимости от их дат и приоритетов.
+
+    Формат файла:
+        Такой же, как для обычных потребностей (import-requirements).
+        Все работы в этом файле автоматически помечаются как аварийные.
+
+    Сортировка аварийных работ:
+        Только по дате начала (ASC). Поле «Приоритет» не учитывается.
+
+    Пример:
+        maps import-emergency data/emergency_works.xlsx
+    """
+    if not file.exists():
+        console.print(f"[red]✗ Файл не найден: {file}[/red]")
+        raise typer.Exit(code=1)
+
+    console.print(f"Импорт [bold red]АВАРИЙНЫХ[/bold red] работ из: [cyan]{file}[/cyan]")
+
+    from app.services.import_service import import_emergency_works
+
+    with console.status("Импортируем аварийные работы..."):
+        try:
+            sheet_name: int | str = int(sheet) if sheet.isdigit() else sheet
+            stats = import_emergency_works(file, sheet_name=sheet_name)
+        except Exception as e:
+            console.print(f"[red]✗ Ошибка импорта: {e}[/red]")
+            raise typer.Exit(code=1)
+
+    _print_import_stats("Аварийные работы", stats)
 
 
 @app.command(name="import-stock")
@@ -151,10 +265,14 @@ def import_stock_cmd(
     sheet: str = typer.Option("0", "--sheet", "-s", help="Имя или номер листа"),
 ) -> None:
     """
-    Импортировать складские остатки (партии) из Excel файла.
+    Импортировать складские остатки (партии материалов) из Excel.
 
-    ВНИМАНИЕ: Существующие остатки будут заменены данными из файла!
-    Это соответствует логике "снимок склада на текущий момент".
+    Формат файла:
+        Код склада, Системный номер, Количество, Стоимость за ед,
+        Номер партии, Дата поступления, Филиал склада, Завод склада, ...
+
+    ВНИМАНИЕ: Существующие складские остатки будут УДАЛЕНЫ и заменены
+    данными из файла! Это соответствует логике «снимок склада на текущий момент».
 
     Пример:
         maps import-stock data/stock.xlsx
@@ -176,7 +294,7 @@ def import_stock_cmd(
             console.print(f"[red]✗ Ошибка импорта: {e}[/red]")
             raise typer.Exit(code=1)
 
-    _print_import_stats("Остатки", stats)
+    _print_import_stats("Складские остатки", stats)
 
 
 @app.command(name="import-supplies")
@@ -185,9 +303,19 @@ def import_supplies_cmd(
     sheet: str = typer.Option("0", "--sheet", "-s", help="Имя или номер листа"),
 ) -> None:
     """
-    Импортировать поставки (материалы в пути) из Excel файла.
+    Импортировать поставки (материалы в пути) из Excel.
 
-    ВНИМАНИЕ: Существующие поставки будут заменены данными из файла!
+    Поставки — это материалы, заказанные по договору, которые ещё не прибыли.
+    Алгоритм резервирует их для работ (Слой 4 распределения).
+
+    Важно: Поставки привязаны к ФИЛИАЛУ.
+    Работа получает поставки только своего филиала (work.filial == supply.filial).
+
+    Формат файла:
+        Договор, Поставщик, Филиал, Дата поставки,
+        Системный номер, Количество, Стоимость за ед, Статус
+
+    ВНИМАНИЕ: Существующие поставки будут УДАЛЕНЫ и заменены!
 
     Пример:
         maps import-supplies data/supplies.xlsx
@@ -197,6 +325,7 @@ def import_supplies_cmd(
         raise typer.Exit(code=1)
 
     console.print(f"Импорт поставок из: [cyan]{file}[/cyan]")
+    console.print("[yellow]⚠ Существующие поставки будут заменены[/yellow]")
 
     from app.services.import_service import import_supplies
 
@@ -211,6 +340,97 @@ def import_supplies_cmd(
     _print_import_stats("Поставки", stats)
 
 
+@app.command(name="import-writeoffs")
+def import_writeoffs_cmd(
+    file: Path = typer.Argument(..., help="Путь к Excel файлу с фактическими списаниями"),
+    sheet: str = typer.Option("0", "--sheet", "-s", help="Имя или номер листа"),
+) -> None:
+    """
+    Импортировать фактические списания материалов на работы (Слой 1).
+
+    Что такое фактические списания?
+        Материалы, которые уже документально списаны на работу в SAP.
+        Это самый надёжный источник покрытия потребности.
+        Алгоритм обрабатывает их ПЕРВЫМИ.
+
+    ВАЖНО: Сначала импортируйте потребности (import-requirements),
+    иначе строки будут пропущены (работы не найдены в БД).
+
+    Формат файла:
+        Код работы, Системный номер, Количество,
+        Стоимость за ед, Сумма, Номер документа, Дата списания
+
+    ВНИМАНИЕ: Существующие записи списаний будут УДАЛЕНЫ и заменены!
+
+    Пример:
+        maps import-writeoffs data/writeoffs.xlsx
+    """
+    if not file.exists():
+        console.print(f"[red]✗ Файл не найден: {file}[/red]")
+        raise typer.Exit(code=1)
+
+    console.print(f"Импорт фактических списаний (Слой 1) из: [cyan]{file}[/cyan]")
+    console.print("[yellow]⚠ Существующие записи списаний будут заменены[/yellow]")
+
+    from app.services.import_service import import_writeoffs
+
+    with console.status("Импортируем данные..."):
+        try:
+            sheet_name: int | str = int(sheet) if sheet.isdigit() else sheet
+            stats = import_writeoffs(file, sheet_name=sheet_name)
+        except Exception as e:
+            console.print(f"[red]✗ Ошибка импорта: {e}[/red]")
+            raise typer.Exit(code=1)
+
+    _print_import_stats("Фактические списания", stats)
+
+
+@app.command(name="import-issued")
+def import_issued_cmd(
+    file: Path = typer.Argument(..., help="Путь к Excel файлу «Выдано не списано»"),
+    sheet: str = typer.Option("0", "--sheet", "-s", help="Имя или номер листа"),
+) -> None:
+    """
+    Импортировать данные «Выдано не списано» (Слой 2).
+
+    Что такое «Выдано не списано»?
+        Материал уже выдан со склада на объект (бригада получила физически),
+        но документ списания в SAP ещё не оформлен.
+        Алгоритм обрабатывает их ВТОРЫМИ (после фактических списаний).
+
+    Поле «Код склада» — информативное. Остатки склада НЕ изменяются.
+
+    ВАЖНО: Сначала импортируйте потребности (import-requirements).
+
+    Формат файла:
+        Код работы, Системный номер, Количество,
+        Стоимость за ед, Сумма, Код склада, Дата выдачи
+
+    ВНИМАНИЕ: Существующие записи будут УДАЛЕНЫ и заменены!
+
+    Пример:
+        maps import-issued data/issued_not_written_off.xlsx
+    """
+    if not file.exists():
+        console.print(f"[red]✗ Файл не найден: {file}[/red]")
+        raise typer.Exit(code=1)
+
+    console.print(f"Импорт «Выдано не списано» (Слой 2) из: [cyan]{file}[/cyan]")
+    console.print("[yellow]⚠ Существующие записи будут заменены[/yellow]")
+
+    from app.services.import_service import import_issued_not_written_off
+
+    with console.status("Импортируем данные..."):
+        try:
+            sheet_name: int | str = int(sheet) if sheet.isdigit() else sheet
+            stats = import_issued_not_written_off(file, sheet_name=sheet_name)
+        except Exception as e:
+            console.print(f"[red]✗ Ошибка импорта: {e}[/red]")
+            raise typer.Exit(code=1)
+
+    _print_import_stats("Выдано не списано", stats)
+
+
 # =============================================================================
 # Команда: allocate — запуск распределения
 # =============================================================================
@@ -219,29 +439,45 @@ def import_supplies_cmd(
 def allocate(
     session_id: Optional[str] = typer.Option(
         None, "--session", "-s",
-        help="ID сессии (по умолчанию генерируется автоматически)"
+        help="ID сессии (по умолчанию генерируется автоматически как YYYYMMDD_HHMMSS_XXXXX)"
     ),
 ) -> None:
     """
-    Запустить алгоритм распределения материалов.
+    Запустить алгоритм распределения материалов по всем 5 слоям.
 
-    Алгоритм:
-        1. Сортирует работы по приоритету
-        2. Распределяет материалы со складов (FIFO)
-        3. Резервирует из поставок (если склада не хватает)
-        4. Фиксирует дефицит
+    Порядок обработки работ:
+        1. Аварийные работы (по дате начала ASC)
+        2. Обычные работы (по дате начала ASC — главный, затем приоритет)
 
-    Результаты сохраняются в БД. Используйте 'maps export' для Excel-отчёта.
+    Слои распределения для каждой потребности:
+        Слой 1: Фактические списания (WriteOff)
+        Слой 2: Выдано не списано (IssuedNotWrittenOff)
+        Слой 3: Склад своего завода → своего филиала (FIFO)
+        Слой 4: Поставки своего филиала
+        Слой 5: К закупу (дефицит)
+        + Анализ: Возможное перемещение из других филиалов
 
-    Пример:
+    Результаты сохраняются в БД.
+    Используйте 'maps export SESSION_ID' для создания Excel-отчёта.
+
+    Примеры:
         maps allocate
-        maps allocate --session "сценарий_2026_05"
+        maps allocate --session "сценарий_июнь_2026"
     """
     from app.allocation.engine import AllocationEngine
     from app.db.database import get_session
 
     console.print(Panel(
-        "[bold]Запуск распределения материалов[/bold]",
+        "[bold]Запуск распределения материалов[/bold]\n\n"
+        "Порядок обработки:\n"
+        "  1. Аварийные работы (is_emergency=True)\n"
+        "  2. Обычные работы (по дате начала → приоритет)\n\n"
+        "Слои покрытия:\n"
+        "  Слой 1: Фактические списания\n"
+        "  Слой 2: Выдано не списано\n"
+        "  Слой 3: Склад (свой завод/филиал)\n"
+        "  Слой 4: Поставки (свой филиал)\n"
+        "  Слой 5: К закупу",
         title="MAPS — Распределение",
     ))
 
@@ -250,28 +486,38 @@ def allocate(
             with get_session() as session:
                 engine = AllocationEngine(session, session_id=session_id)
                 result_session = engine.run()
+                # Считываем атрибуты пока сессия ещё открыта —
+                # после выхода из блока объект отсоединяется от сессии
+                sid            = result_session.id
+                total_req      = result_session.total_requirements
+                total_alloc    = result_session.total_allocated
+                total_deficit  = result_session.total_deficit
         except Exception as e:
             console.print(f"[red]✗ Ошибка распределения: {e}[/red]")
             raise typer.Exit(code=1)
 
-    # Итоговая таблица результатов
     console.print(f"\n[green]✓ Распределение завершено![/green]")
-    console.print(f"  ID сессии: [cyan]{result_session.id}[/cyan]")
+    console.print(f"  ID сессии: [cyan]{sid}[/cyan]")
 
+    # Итоговая таблица результатов
     table = Table(title="Результаты распределения")
     table.add_column("Показатель", style="bold")
     table.add_column("Значение", justify="right")
-    table.add_row("Обработано потребностей", str(result_session.total_requirements))
-    table.add_row("Строк распределения",    str(result_session.total_allocated))
-    table.add_row("Позиций дефицита",       str(result_session.total_deficit), style="red" if result_session.total_deficit > 0 else "green")
+    table.add_row("Обработано потребностей", str(total_req))
+    table.add_row("Строк распределения",    str(total_alloc))
+    table.add_row(
+        "Позиций дефицита",
+        str(total_deficit),
+        style="red" if total_deficit > 0 else "green",
+    )
     console.print(table)
 
     console.print(f"\nДля экспорта в Excel:")
-    console.print(f"  [cyan]maps export {result_session.id}[/cyan]")
+    console.print(f"  [cyan]maps export {sid}[/cyan]")
 
 
 # =============================================================================
-# Команда: export — экспорт результатов
+# Команда: export — экспорт результатов в Excel
 # =============================================================================
 
 @app.command()
@@ -283,15 +529,16 @@ def export(
     ),
 ) -> None:
     """
-    Экспортировать результаты распределения в Excel.
+    Экспортировать результаты распределения в Excel (4 листа).
 
-    Создаёт файл с 4 листами:
-        - Распределение
-        - Движение склада
-        - Дефицит
-        - Обеспеченность
+    Структура Excel-отчёта:
+        1. «Распределение» — широкая таблица: все слои для каждой потребности.
+           Колонки: Работа | Материал | Потребность | Сп-е | Выд-но | Склад | Поставки | К закупу | %
+        2. «Движение склада» — детальное движение по партиям
+        3. «Остатки складов» — что осталось на складах после распределения
+        4. «Возможное перемещение» — анализ: склады других филиалов
 
-    Пример:
+    Примеры:
         maps export 20260523_143000_abc12
         maps export 20260523_143000_abc12 --output /tmp/reports
     """
@@ -299,7 +546,7 @@ def export(
 
     console.print(f"Экспорт сессии: [cyan]{session_id}[/cyan]")
 
-    with console.status("Формируем Excel отчёт..."):
+    with console.status("Формируем Excel отчёт (4 листа)..."):
         try:
             file_path = export_allocation_results(session_id, output_dir=output_dir)
         except Exception as e:
@@ -307,6 +554,11 @@ def export(
             raise typer.Exit(code=1)
 
     console.print(f"[green]✓ Файл создан: {file_path}[/green]")
+    console.print("\nСтруктура отчёта:")
+    console.print("  1. «Распределение» — главная широкая таблица")
+    console.print("  2. «Движение склада» — детально по партиям")
+    console.print("  3. «Остатки складов» — что осталось")
+    console.print("  4. «Возможное перемещение» — анализ других филиалов")
 
 
 # =============================================================================
@@ -316,9 +568,11 @@ def export(
 @app.command()
 def status() -> None:
     """
-    Показать текущее состояние базы данных.
+    Показать текущее состояние базы данных MAPS.
 
-    Выводит количество записей в каждой таблице и последние сессии.
+    Выводит:
+        - Количество записей в каждой таблице
+        - Последние 5 сессий распределения
 
     Пример:
         maps status
@@ -331,40 +585,48 @@ def status() -> None:
 
     try:
         with get_session() as session:
-            # Считаем записи в каждой таблице
+            # Список таблиц для подсчёта записей
             tables = [
-                ("works", "Работы"),
-                ("materials", "Материалы"),
-                ("requirements", "Потребности"),
-                ("warehouses", "Склады"),
-                ("stock_batches", "Партии на складах"),
-                ("supplies", "Поставки"),
-                ("supply_lines", "Строки поставок"),
-                ("allocation_sessions", "Сессии распределения"),
-                ("allocation_results", "Строки распределения"),
-                ("deficit_records", "Записи дефицита"),
+                # (имя_таблицы_в_бд, понятное_название)
+                ("works",                     "Работы (всего)"),
+                ("works",                     "Аварийные работы",    "WHERE is_emergency = TRUE"),
+                ("materials",                 "Материалы"),
+                ("requirements",              "Потребности"),
+                ("warehouses",                "Склады"),
+                ("stock_batches",             "Партии на складах"),
+                ("supplies",                  "Поставки"),
+                ("supply_lines",              "Строки поставок"),
+                ("writeoffs",                 "Фактические списания (Слой 1)"),
+                ("issued_not_written_off",    "Выдано не списано (Слой 2)"),
+                ("allocation_sessions",       "Сессии распределения"),
+                ("allocation_results",        "Строки распределения"),
+                ("deficit_records",           "Записи дефицита (К закупу)"),
             ]
 
-            table = Table(title="Количество записей")
-            table.add_column("Таблица", style="bold")
+            table = Table(title="Количество записей в таблицах")
+            table.add_column("Таблица / Группа", style="bold")
             table.add_column("Записей", justify="right")
 
-            for table_name, label in tables:
+            for entry in tables:
+                tbl_name = entry[0]
+                label    = entry[1]
+                where    = entry[2] if len(entry) > 2 else ""
                 try:
-                    count = session.execute(
-                        text(f"SELECT COUNT(*) FROM {table_name}")  # noqa: S608
-                    ).scalar()
-                    table.add_row(label, str(count))
+                    # noqa: S608 — запрос не содержит пользовательских данных
+                    sql = f"SELECT COUNT(*) FROM {tbl_name} {where}"  # noqa: S608
+                    count = session.execute(text(sql)).scalar()
+                    color = "green" if count and count > 0 else "dim"
+                    table.add_row(label, f"[{color}]{count}[/{color}]")
                 except Exception:
                     table.add_row(label, "[red]ошибка[/red]")
 
             console.print(table)
 
-            # Последние 5 сессий
+            # Последние 5 сессий распределения
             try:
                 sessions = session.execute(text("""
                     SELECT id, status, started_at,
-                           total_requirements, total_deficit
+                           total_requirements, total_allocated, total_deficit
                     FROM allocation_sessions
                     ORDER BY started_at DESC
                     LIMIT 5
@@ -374,20 +636,25 @@ def status() -> None:
                     sess_table = Table(title="Последние сессии распределения")
                     sess_table.add_column("ID сессии")
                     sess_table.add_column("Статус")
-                    sess_table.add_column("Дата")
+                    sess_table.add_column("Дата запуска")
                     sess_table.add_column("Потребностей", justify="right")
+                    sess_table.add_column("Распределено", justify="right")
                     sess_table.add_column("Дефицит", justify="right")
 
                     for s in sessions:
+                        status_color = "green" if s.status == "completed" else "red"
+                        deficit_color = "red" if s.total_deficit > 0 else "green"
                         sess_table.add_row(
-                            s.id, s.status,
+                            s.id,
+                            f"[{status_color}]{s.status}[/{status_color}]",
                             str(s.started_at)[:19],
                             str(s.total_requirements),
-                            str(s.total_deficit),
+                            str(s.total_allocated),
+                            f"[{deficit_color}]{s.total_deficit}[/{deficit_color}]",
                         )
                     console.print(sess_table)
             except Exception:
-                pass  # Таблица ещё не создана
+                pass  # Таблица ещё не создана — пропускаем
 
     except Exception as e:
         console.print(f"[red]✗ Ошибка подключения к БД: {e}[/red]")
@@ -399,13 +666,24 @@ def status() -> None:
 # =============================================================================
 
 def _print_import_stats(name: str, stats: dict[str, int]) -> None:
-    """Красиво вывести статистику импорта."""
+    """
+    Красиво вывести таблицу статистики после импорта.
+
+    Ключ "errors" выделяется красным если > 0.
+    Ключ "skipped" выделяется жёлтым если > 0.
+    Остальные ключи — зелёным.
+    """
     table = Table(title=f"Результат импорта: {name}")
     table.add_column("Показатель", style="bold")
     table.add_column("Значение", justify="right")
 
     for key, value in stats.items():
-        color = "red" if key == "errors" and value > 0 else "green"
+        if key == "errors" and value > 0:
+            color = "red"
+        elif key == "skipped" and value > 0:
+            color = "yellow"
+        else:
+            color = "green"
         table.add_row(key, f"[{color}]{value}[/{color}]")
 
     console.print(table)
@@ -417,4 +695,5 @@ def _print_import_stats(name: str, stats: dict[str, int]) -> None:
 
 if __name__ == "__main__":
     # При прямом запуске: python main.py <команда>
+    # После установки (pip install -e .): maps <команда>
     app()
