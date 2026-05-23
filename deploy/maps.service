@@ -1,0 +1,80 @@
+# =============================================================================
+# deploy/maps.service — systemd-юнит для автозапуска MAPS
+#
+# Что такое systemd-юнит?
+#   Файл конфигурации для системы инициализации Linux.
+#   Позволяет запускать сервис автоматически при старте системы,
+#   перезапускать при падении, смотреть логи через journalctl.
+#
+# Установка (делает setup.sh автоматически):
+#   sudo cp deploy/maps.service /etc/systemd/system/maps.service
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable maps
+#   sudo systemctl start maps
+#
+# Управление:
+#   sudo systemctl start maps      — запустить
+#   sudo systemctl stop maps       — остановить
+#   sudo systemctl restart maps    — перезапустить
+#   sudo systemctl status maps     — статус + последние логи
+#   sudo journalctl -u maps -f     — логи в реальном времени
+#   sudo journalctl -u maps --since "1 hour ago"  — логи за час
+#
+# Плейсхолдеры __PROJECT_DIR__, __APP_USER__, __VENV_DIR__
+# заменяются скриптом setup.sh через sed.
+# =============================================================================
+
+[Unit]
+# Описание сервиса (видно в systemctl status)
+Description=MAPS — Material Allocation & Planning System
+# Ждём полной готовности сети перед запуском
+After=network.target
+# Запускаем ПОСЛЕ PostgreSQL — нам нужна БД
+After=postgresql.service
+# Если PostgreSQL упал — MAPS тоже остановится
+Requires=postgresql.service
+
+[Service]
+# Тип "simple": systemd считает сервис запущенным сразу после старта процесса
+Type=simple
+
+# От чьего имени запускать (не root — безопаснее)
+User=__APP_USER__
+Group=__APP_USER__
+
+# Рабочая директория — корень проекта
+WorkingDirectory=__PROJECT_DIR__
+
+# Переменные окружения из .env файла
+# EnvironmentFile читает файл построчно: KEY=VALUE
+EnvironmentFile=__PROJECT_DIR__/.env
+
+# Команда запуска:
+#   __VENV_DIR__/bin/uvicorn — uvicorn из виртуального окружения
+#   app.api.main:app         — модуль:переменная FastAPI-приложения
+#   --host 0.0.0.0           — слушать все сетевые интерфейсы
+#   --port 8000              — порт (cloudflared проксирует его наружу)
+#   --workers 2              — 2 воркера для параллельной обработки запросов
+#   --log-level info         — уровень логирования
+ExecStart=__VENV_DIR__/bin/uvicorn app.api.main:app \
+    --host 0.0.0.0 \
+    --port 8000 \
+    --workers 2 \
+    --log-level info
+
+# Перезапускать автоматически при падении (но не при ручной остановке)
+Restart=on-failure
+# Ждать 5 секунд перед перезапуском
+RestartSec=5s
+
+# Логи пишутся через journald (смотреть: journalctl -u maps -f)
+StandardOutput=journal
+StandardError=journal
+
+# Таймаут на graceful shutdown (сколько ждать завершения запросов)
+TimeoutStopSec=30
+
+[Install]
+# В какой "цели" активировать сервис:
+# multi-user.target = нормальный многопользовательский режим без GUI
+WantedBy=multi-user.target
