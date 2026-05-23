@@ -23,6 +23,7 @@ from pydantic import BaseModel
 
 from app.ai.deficit_analyzer import explain_deficit, list_deficit_materials
 from app.ai.deficit_forecaster import forecast_deficit
+from app.ai.session_rag import answer_question
 from app.core.config import settings
 from app.db.database import get_session
 
@@ -159,5 +160,59 @@ def get_forecast(sessions: int = 5) -> dict:
             )
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"Ошибка прогноза: {e}")
+
+    return result
+
+
+class ChatRequest(BaseModel):
+    """Тело POST /api/ai/chat."""
+    question: str
+    # История предыдущих сообщений — для уточняющих вопросов в рамках беседы
+    # Каждый элемент: {"role": "user"/"assistant", "content": "..."}
+    history: list[dict] = []
+
+
+@router.post("/ai/chat")
+def chat_with_history(body: ChatRequest) -> dict:
+    """
+    RAG-чат по истории сессий распределения.
+
+    Принимает вопрос пользователя (и опционально историю беседы),
+    находит релевантные сессии, формирует контекст и возвращает ответ Claude.
+
+    Тело запроса:
+        {
+            "question": "Когда последний раз был дефицит по кабелю ВВГ?",
+            "history": []  // предыдущие сообщения (опционально)
+        }
+
+    Ответ:
+        {
+            "answer": "...",           // ответ Claude
+            "sessions_used": 3,        // сколько сессий попало в контекст
+            "total_sessions": 10,      // всего сессий в истории
+            "retrieved_ids": [...]     // какие именно сессии использованы
+        }
+    """
+    api_key = settings.anthropic_api_key
+    if not api_key:
+        raise HTTPException(
+            status_code=503,
+            detail="AI-анализ недоступен: ANTHROPIC_API_KEY не задан в .env",
+        )
+
+    if not body.question.strip():
+        raise HTTPException(status_code=400, detail="Вопрос не может быть пустым")
+
+    try:
+        with get_session() as session:
+            result = answer_question(
+                session=session,
+                question=body.question,
+                api_key=api_key,
+                history=body.history or [],
+            )
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Ошибка RAG-чата: {e}")
 
     return result

@@ -40,6 +40,17 @@
         /* AI-анализ */
         .ai-card { border: none; border-radius: 12px; box-shadow: 0 2px 8px rgba(0,0,0,.08); }
         .ai-explanation { white-space: pre-wrap; line-height: 1.8; font-size: 0.95rem; }
+
+        /* RAG-чат */
+        .chat-box { height: 360px; overflow-y: auto; background: #f8f9fa; border-radius: 10px; padding: 1rem; }
+        .chat-msg { margin-bottom: 0.75rem; max-width: 88%; }
+        .chat-msg.user { margin-left: auto; }
+        .chat-msg.user .bubble { background: #0d6efd; color: #fff; border-radius: 14px 14px 4px 14px; }
+        .chat-msg.assistant .bubble { background: #fff; border: 1px solid #dee2e6; border-radius: 14px 14px 14px 4px; }
+        .bubble { padding: 0.6rem 0.9rem; font-size: 0.9rem; white-space: pre-wrap; line-height: 1.6; }
+        .chat-meta { font-size: 0.72rem; color: #aaa; margin-top: 3px; }
+        .chat-msg.user .chat-meta { text-align: right; }
+        .chat-input-row { display: flex; gap: 0.5rem; margin-top: 0.75rem; }
     </style>
 </head>
 <body>
@@ -279,6 +290,39 @@
         </div>
 
     </div><!-- /row -->
+
+    <!-- ============================ RAG-ЧАТ ================================ -->
+    <div class="ai-card card p-4 mt-2 mb-4">
+        <h5 class="fw-bold mb-1">
+            <i class="bi bi-chat-dots me-2 text-success"></i>Вопросы по истории распределений
+        </h5>
+        <p class="text-muted small mb-3">
+            Спрашивайте на русском: «Когда последний раз был дефицит по кабелю?»,
+            «Какой материал чаще всего в дефиците?», «Сравни последние сессии» и т.д.
+        </p>
+
+        <!-- Область сообщений -->
+        <div class="chat-box" id="chat-box">
+            <div class="chat-msg assistant">
+                <div class="bubble">Привет! Я могу ответить на вопросы по истории сессий распределения MAPS.
+Спросите, например:
+• «Какие материалы были в дефиците?»
+• «Когда последний раз не хватало цемента?»
+• «Сравни сессии по количеству дефицитов»</div>
+            </div>
+        </div>
+
+        <!-- Поле ввода -->
+        <div class="chat-input-row">
+            <input type="text" class="form-control" id="chat-input"
+                   placeholder="Задайте вопрос по истории сессий…"
+                   onkeydown="if(event.key==='Enter' && !event.shiftKey){ event.preventDefault(); sendChat(); }">
+            <button class="btn btn-success px-3" onclick="sendChat()" id="btn-chat">
+                <i class="bi bi-send"></i>
+            </button>
+        </div>
+        <div class="text-muted small mt-1" id="chat-meta-hint"></div>
+    </div>
 
     <!-- ======================= AI-АНАЛИЗ ДЕФИЦИТА ======================== -->
     <div class="ai-card card p-4 mt-2 mb-4">
@@ -544,6 +588,88 @@ async function uploadFile(input, endpoint, resultId) {
 // ============================================================================
 // AI-анализ дефицита
 // ============================================================================
+
+// ============================================================================
+// RAG-чат по истории сессий
+// ============================================================================
+
+// История беседы — для уточняющих вопросов
+let chatHistory = [];
+
+function appendChatMessage(role, text, meta) {
+    const box = document.getElementById("chat-box");
+    const div = document.createElement("div");
+    div.className = `chat-msg ${role}`;
+
+    const bubble = document.createElement("div");
+    bubble.className = "bubble";
+    bubble.textContent = text;
+    div.appendChild(bubble);
+
+    if (meta) {
+        const m = document.createElement("div");
+        m.className = "chat-meta";
+        m.textContent = meta;
+        div.appendChild(m);
+    }
+
+    box.appendChild(div);
+    box.scrollTop = box.scrollHeight;  // Прокрутка вниз
+}
+
+async function sendChat() {
+    const input = document.getElementById("chat-input");
+    const btn = document.getElementById("btn-chat");
+    const question = input.value.trim();
+    if (!question) return;
+
+    // Показываем вопрос
+    appendChatMessage("user", question, null);
+    input.value = "";
+    btn.disabled = true;
+
+    // Показываем индикатор загрузки
+    const box = document.getElementById("chat-box");
+    const loadingDiv = document.createElement("div");
+    loadingDiv.className = "chat-msg assistant";
+    loadingDiv.id = "chat-loading-msg";
+    loadingDiv.innerHTML = `<div class="bubble text-muted">
+        <span class="spinner-border spinner-border-sm me-1"></span> Claude думает…
+    </div>`;
+    box.appendChild(loadingDiv);
+    box.scrollTop = box.scrollHeight;
+
+    try {
+        const r = await fetch("/api/ai/chat", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ question, history: chatHistory }),
+        });
+        const d = await r.json();
+
+        // Убираем индикатор
+        document.getElementById("chat-loading-msg")?.remove();
+
+        if (!r.ok) throw new Error(d.detail || "Ошибка чата");
+
+        const meta = `Использовано сессий: ${d.sessions_used} из ${d.total_sessions}`;
+        appendChatMessage("assistant", d.answer, meta);
+        document.getElementById("chat-meta-hint").textContent = "";
+
+        // Сохраняем в историю (без контекста — только диалог)
+        chatHistory.push({ role: "user", content: question });
+        chatHistory.push({ role: "assistant", content: d.answer });
+        // Ограничиваем историю последними 10 парами
+        if (chatHistory.length > 20) chatHistory = chatHistory.slice(-20);
+
+    } catch(e) {
+        document.getElementById("chat-loading-msg")?.remove();
+        appendChatMessage("assistant", "Ошибка: " + e.message, null);
+    } finally {
+        btn.disabled = false;
+        input.focus();
+    }
+}
 
 // ============================================================================
 // Прогноз дефицита
