@@ -1,33 +1,37 @@
 """
 app/allocation/engine.py — Ядро системы: алгоритм распределения материалов
 
-Это главный модуль системы. Здесь реализована вся бизнес-логика распределения.
+Логика распределения (три фазы):
+─────────────────────────────────────────────────────────────────────────────
+  ФАЗА 1 — Склад (фактическое распределение)
+      Приоритет 1: склады того же завода (zavod == work.zavod)
+      Приоритет 2: склады того же филиала (filial == work.filial)
 
-Как работает алгоритм (пошагово):
-    1. Загружаем все потребности работ из БД, отсортированные по приоритету
-    2. Для каждой потребности (работа + материал + нужное количество):
-       а) Считаем остаток: сколько ещё нужно = потребность - уже распределено
-       б) ФАЗА 1 — Склад:
-          - Берём партии материала, сгруппированные по приоритету склада:
-            * Приоритет 1: склады того же завода, что и работа
-            * Приоритет 2: склады того же филиала
-            * Приоритет 3: все остальные склады
-          - Внутри каждой группы — FIFO (старые партии первыми)
-          - Списываем с каждой партии сколько можем
-       в) ФАЗА 2 — Поставки (если после склада ещё не хватает):
-          - Берём ожидаемые поставки (материалы в пути)
-          - Сортируем по дате поставки (ближайшие первые)
-          - Резервируем нужное количество
-       г) ФАЗА 3 — Дефицит (если всё равно не хватает):
-          - Создаём запись о дефиците → "к закупу"
-    3. Сохраняем все результаты в БД (allocation_results, stock_movements, deficit_records)
+      Для каждого приоритета:
+        • Обходим партии в порядке FIFO (старые первыми)
+        • Списываем со склада, обновляем доступные остатки
+        • Агрегируем по складу: одна строка результата = один склад
+        • Стоимость = СРЕДНЯЯ ВЗВЕШЕННАЯ по всем партиям склада
 
-Ключевые гарантии алгоритма:
-    ✓ Нет отрицательных остатков (никогда не берём больше, чем есть)
-    ✓ Нет превышения потребности (не распределяем больше, чем нужно)
-    ✓ Нет двойного распределения (отслеживаем доступность в памяти)
-    ✓ FIFO (строгое соблюдение порядка партий)
-    ✓ Все суммы записываются отдельно для каждой партии
+  ФАЗА 1б — Возможное движение (другой филиал, НЕ распределяем)
+      Склады чужих филиалов (filial != work.filial и zavod != work.zavod)
+      • Остатки НЕ трогаем (is_possible = True)
+      • Показываем: сколько теоретически можно перебросить
+      • Стоимость также взвешенная средняя
+
+  ФАЗА 2 — Поставки (фактическое резервирование)
+      Если после фазы 1 ещё остался дефицит — резервируем из поставок
+
+  ФАЗА 3 — Дефицит
+      Остаток, который не покрыт ни складом, ни поставками → «К закупу»
+
+Ключевые гарантии:
+    ✓ Нет отрицательных остатков
+    ✓ Нет превышения потребности
+    ✓ Нет двойного распределения
+    ✓ FIFO внутри каждого приоритета
+    ✓ Средняя взвешенная стоимость (не цена одной партии)
+    ✓ Другие филиалы показаны отдельно как «возможное»
 """
 
 import uuid
@@ -54,162 +58,171 @@ from app.repositories.work_repository import RequirementRepository
 
 logger = get_logger(__name__)
 
-# Минимальное значимое количество — меньше этого считаем нулём.
-# Нужно из-за округлений Decimal: 0.00001 не должен считаться "остатком".
+# Минимальное значимое количество (всё что меньше — считаем нулём)
 EPSILON = Decimal("0.0001")
 
+
+# =============================================================================
+# Вспомогательный класс для накопления количества и стоимости по складу
+# =============================================================================
+
+class _WarehouseAccumulator:
+    """
+    Накапливает количество и стоимость со всех партий одного склада.
+
+    Зачем нужен?
+        Один склад может иметь несколько партий с разными ценами.
+        Нам нужна одна строка результата на склад со средней взвешенной ценой.
+
+    Средняя взвешенная цена:
+        avg = (qty1 * price1 + qty2 * price2) / (qty1 + qty2)
+
+    Пример:
+        Партия 1: 100 м × 1500 тг = 150 000 тг
+        Партия 2:  50 м × 1600 тг =  80 000 тг
+        Итого: 150 м, средняя цена = 230 000 / 150 = 1533.33 тг/м
+    """
+
+    def __init__(self, warehouse_id: int, is_possible: bool, tip: str) -> None:
+        self.warehouse_id = warehouse_id
+        self.is_possible = is_possible      # True = возможное, False = фактическое
+        self.tip = tip                      # "zavod" | "filial" | "vozmozhnoe"
+        self.total_qty = Decimal("0")
+        self.weighted_cost_sum = Decimal("0")  # sum(qty_i * price_i)
+
+    def add(self, qty: Decimal, cost_per_unit: Decimal) -> None:
+        """Добавить партию в накопитель."""
+        self.total_qty += qty
+        self.weighted_cost_sum += qty * cost_per_unit
+
+    @property
+    def avg_cost(self) -> Decimal:
+        """Средняя взвешенная стоимость за единицу."""
+        if self.total_qty < EPSILON:
+            return Decimal("0")
+        return (self.weighted_cost_sum / self.total_qty).quantize(Decimal("0.0001"))
+
+    @property
+    def total_sum(self) -> Decimal:
+        """Общая сумма = количество × средняя цена."""
+        return (self.total_qty * self.avg_cost).quantize(Decimal("0.01"))
+
+
+# =============================================================================
+# Основной движок распределения
+# =============================================================================
 
 class AllocationEngine:
     """
     Движок распределения материалов.
 
-    Пример использования:
+    Использование:
         with get_session() as session:
             engine = AllocationEngine(session, session_id="2026-05-23_run1")
-            engine.run()
+            report = engine.run()
     """
 
     def __init__(self, session: Session, session_id: Optional[str] = None) -> None:
-        """
-        Инициализация движка.
-
-        Args:
-            session:    Сессия БД (открытое соединение с PostgreSQL)
-            session_id: Уникальный ID этого прогона. Если None — генерируется автоматически.
-                        Используется для хранения результатов нескольких прогонов.
-        """
         self.session = session
-        # Генерируем ID вида "2026-05-23_abc12" если не задан явно
         self.session_id = session_id or f"{datetime.now():%Y%m%d_%H%M%S}_{uuid.uuid4().hex[:5]}"
 
-        # Репозитории — наш интерфейс к БД
         self.req_repo = RequirementRepository(session)
         self.batch_repo = StockBatchRepository(session)
         self.supply_repo = SupplyRepository(session)
 
-        # Буферы результатов — накапливаем в памяти, потом сохраняем одним bulk insert.
-        # Это НАМНОГО быстрее чем сохранять каждую строку отдельно.
+        # Буферы для batch-insert в конце (намного быстрее чем построчно)
         self._allocation_buffer: list[AllocationResult] = []
         self._movement_buffer: list[StockMovement] = []
         self._deficit_buffer: list[DeficitRecord] = []
 
-        # Кэш доступности — хранит актуальные остатки в памяти.
-        # Ключ: batch_id или supply_line_id, Значение: доступное количество.
-        # БД обновляется только в конце — это избегает тысяч отдельных UPDATE запросов.
+        # Кэш доступности партий и поставок в памяти.
+        # Обновляется при каждом распределении, в БД пишется в конце одним UPDATE.
         self._batch_cache: dict[int, Decimal] = {}
         self._supply_cache: dict[int, Decimal] = {}
 
-        # Счётчики для статистики
         self._stats = {
             "requirements_processed": 0,
-            "allocated_from_warehouse": 0,
-            "allocated_from_supply": 0,
+            "allocated_warehouse": 0,
+            "possible_warehouse": 0,
+            "allocated_supply": 0,
             "deficit_records": 0,
         }
 
     # =========================================================================
-    # Публичный метод запуска
+    # Публичный запуск
     # =========================================================================
 
     def run(self) -> AllocationSession:
-        """
-        Запустить полный цикл распределения.
-
-        Returns:
-            AllocationSession с результатами и статистикой прогона
-        """
+        """Запустить полный цикл распределения."""
         logger.info("=" * 60)
-        logger.info("Запуск распределения. Сессия: %s", self.session_id)
+        logger.info("Запуск распределения | Сессия: %s", self.session_id)
         logger.info("=" * 60)
 
-        # Создаём запись о сессии в БД (статус "running")
-        allocation_session = self._create_session_record()
+        alloc_session = self._create_session_record()
 
         try:
-            # 1. Сбрасываем предыдущие результаты распределения (raspredeleno → 0)
             self.req_repo.reset_allocation()
-
-            # 2. Загружаем все потребности, отсортированные по приоритету
             requirements = self.req_repo.get_for_allocation()
             total = len(requirements)
-            logger.info("Загружено потребностей: %d", total)
+            logger.info("Потребностей к распределению: %d", total)
 
-            # 3. Обрабатываем каждую потребность
-            for i, (req, work, material) in enumerate(requirements, 1):
-                if i % 500 == 0:
-                    # Прогресс каждые 500 строк (для больших объёмов)
-                    logger.info("Обработано %d/%d потребностей...", i, total)
-
+            for idx, (req, work, material) in enumerate(requirements, 1):
+                if idx % 500 == 0:
+                    logger.info("Обработано %d / %d...", idx, total)
                 self._process_requirement(req, work, material)
 
-            # 4. Сохраняем все результаты в БД (один batch insert)
-            logger.info("Сохраняем результаты в БД...")
+            logger.info("Сохраняем результаты...")
             self._flush_buffers_to_db()
-
-            # 5. Обновляем поля raspredeleno/deficit в таблице requirements
-            self._update_requirement_totals()
-
-            # 6. Обновляем доступность партий и строк поставок в БД
             self._update_availability_in_db()
+            alloc_session = self._complete_session(alloc_session)
 
-            # 7. Завершаем сессию
-            allocation_session = self._complete_session(allocation_session)
-            logger.info("Распределение завершено. Статистика: %s", self._stats)
+            logger.info("Готово. Статистика: %s", self._stats)
 
         except Exception as exc:
-            # При ошибке помечаем сессию как "failed"
-            allocation_session.status = "failed"
-            allocation_session.notes = str(exc)
-            logger.error("Критическая ошибка при распределении: %s", exc, exc_info=True)
+            alloc_session.status = "failed"
+            alloc_session.notes = str(exc)
+            logger.error("Ошибка при распределении: %s", exc, exc_info=True)
             raise
 
-        return allocation_session
+        return alloc_session
 
     # =========================================================================
     # Обработка одной потребности
     # =========================================================================
 
     def _process_requirement(
-        self,
-        req: Requirement,
-        work: Work,
-        material: Material,
+        self, req: Requirement, work: Work, material: Material
     ) -> None:
-        """
-        Обработать одну потребность: распределить материал из всех источников.
-
-        Args:
-            req:      Потребность (work_id, material_id, potrebnost)
-            work:     Работа (с данными о заводе, филиале, приоритете)
-            material: Материал (системный номер, наименование)
-        """
-        # Сколько ещё нужно распределить
+        """Обработать одну потребность по всем фазам."""
         remaining = req.potrebnost - req.raspredeleno
-
         if remaining < EPSILON:
-            # Потребность уже закрыта (например, была обнулена вручную)
             return
 
         self._stats["requirements_processed"] += 1
 
         logger.debug(
-            "Обработка: работа=%s | материал=%s | нужно=%.4f",
+            "Потребность: %s | %s | нужно=%.4f",
             work.kod_raboty, material.sys_nomer, remaining,
         )
 
-        # --- ФАЗА 1: Распределение со склада ---
+        # Фаза 1: фактическое распределение со склада (свой завод + свой филиал)
         remaining = self._allocate_from_warehouse(req, work, material, remaining)
 
-        # --- ФАЗА 2: Распределение из поставок ---
+        # Фаза 1б: возможное распределение (чужой филиал) — остатки не трогаем
+        # Показываем сколько могли бы взять, если бы разрешили межфилиальный перевод
+        if remaining >= EPSILON:
+            self._record_possible_from_other_filial(req, work, material, remaining)
+
+        # Фаза 2: резервирование из поставок (если ещё не хватает)
         if remaining >= EPSILON:
             remaining = self._allocate_from_supplies(req, work, material, remaining)
 
-        # --- ФАЗА 3: Фиксация дефицита ---
+        # Фаза 3: дефицит (всё что осталось после склада и поставок)
         if remaining >= EPSILON:
             self._record_deficit(req, work, material, remaining)
 
     # =========================================================================
-    # Фаза 1: Склад
+    # Фаза 1: Фактическое распределение со склада
     # =========================================================================
 
     def _allocate_from_warehouse(
@@ -220,91 +233,190 @@ class AllocationEngine:
         remaining: Decimal,
     ) -> Decimal:
         """
-        Распределить материал со складских партий.
+        Распределить материал из складских партий — только свой завод и свой филиал.
 
-        Перебираем группы складов в порядке приоритета (завод → филиал → прочие).
-        Внутри группы — FIFO (старые партии первыми).
+        Алгоритм:
+            1. Получаем партии, сгруппированные по приоритету
+            2. Группы "zavod" и "filial" — фактическое распределение
+            3. Внутри группы: FIFO (старые партии первыми)
+            4. Для каждого склада накапливаем qty и cost → считаем среднюю цену
+            5. Создаём одну строку AllocationResult на склад (агрегированно)
 
         Returns:
-            Остаток потребности после распределения со склада
+            Остаток потребности после фазы 1
         """
-        # Получаем все доступные партии, сгруппированные по приоритету склада
         batches_by_priority = self.batch_repo.get_available_by_warehouse_priority(
             material_id=material.id,
             zavod=work.zavod,
             filial=work.filial,
         )
 
-        # Перебираем группы в порядке убывания приоритета
-        for priority_key in ("zavod", "filial", "prochee"):
+        for priority_key in ("zavod", "filial"):
+            if remaining < EPSILON:
+                break
+
             batches = batches_by_priority[priority_key]
+            if not batches:
+                continue
 
-            for batch in batches:
+            # Накопители по складу: {warehouse_id: _WarehouseAccumulator}
+            # Нужны чтобы объединить несколько партий одного склада в одну строку
+            accumulators: dict[int, _WarehouseAccumulator] = {}
+
+            for batch in batches:  # Уже отсортированы по FIFO в репозитории
                 if remaining < EPSILON:
-                    break  # Потребность закрыта — выходим
+                    break
 
-                # Берём актуальное доступное количество из кэша
-                # (кэш учитывает уже списанное в этом прогоне)
                 available = self._get_batch_available(batch)
                 if available < EPSILON:
-                    continue  # Партия уже исчерпана
-
-                # Списываем: не больше того, что нужно, и не больше того, что есть
-                qty_to_allocate = min(remaining, available).quantize(
-                    Decimal("0.0001"), rounding=ROUND_DOWN
-                )
-
-                if qty_to_allocate < EPSILON:
                     continue
 
-                # Обновляем кэш
-                self._batch_cache[batch.id] = available - qty_to_allocate
+                qty = min(remaining, available).quantize(Decimal("0.0001"), rounding=ROUND_DOWN)
+                if qty < EPSILON:
+                    continue
 
-                # Рассчитываем стоимость
-                cost_per_unit = batch.stoimost_za_ed or Decimal("0")
-                total_cost = (qty_to_allocate * cost_per_unit).quantize(Decimal("0.01"))
+                cost = batch.stoimost_za_ed or Decimal("0")
 
-                # Записываем результат распределения
-                self._allocation_buffer.append(AllocationResult(
-                    session_id=self.session_id,
-                    requirement_id=req.id,
-                    work_id=work.id,
-                    material_id=material.id,
-                    istochnik="sklad",
-                    warehouse_id=batch.warehouse_id,
-                    batch_id=batch.id,
-                    kolichestvo=qty_to_allocate,
-                    stoimost_za_ed=cost_per_unit,
-                    summa=total_cost,
-                    tip_raspredeleniya=priority_key,  # "zavod", "filial" или "prochee"
-                ))
+                # Обновляем кэш — реальное уменьшение остатка
+                self._batch_cache[batch.id] = available - qty
 
-                # Записываем движение склада (расход = отрицательное число)
-                new_batch_available = available - qty_to_allocate
+                # Записываем движение (расход) по конкретной партии
                 self._movement_buffer.append(StockMovement(
                     session_id=self.session_id,
                     warehouse_id=batch.warehouse_id,
                     material_id=material.id,
                     batch_id=batch.id,
                     work_id=work.id,
-                    izmenenie=-qty_to_allocate,   # Отрицательное = расход
-                    ostatok=new_batch_available,  # Остаток после списания
+                    izmenenie=-qty,
+                    ostatok=available - qty,
                 ))
 
-                # Обновляем счётчики
-                req.raspredeleno += qty_to_allocate
-                remaining -= qty_to_allocate
-                self._stats["allocated_from_warehouse"] += 1
+                # Накапливаем для средней стоимости по складу
+                wh_id = batch.warehouse_id
+                if wh_id not in accumulators:
+                    accumulators[wh_id] = _WarehouseAccumulator(
+                        warehouse_id=wh_id,
+                        is_possible=False,
+                        tip=priority_key,
+                    )
+                accumulators[wh_id].add(qty, cost)
+
+                req.raspredeleno += qty
+                remaining -= qty
+                self._stats["allocated_warehouse"] += 1
 
                 logger.debug(
-                    "  Склад [%s]: партия #%s, списано=%.4f, остаток=%.4f",
-                    priority_key, batch.id, qty_to_allocate, new_batch_available,
+                    "  [%s] склад=%d партия=%d списано=%.4f остаток=%.4f",
+                    priority_key, batch.warehouse_id, batch.id, qty, available - qty,
                 )
 
-            if remaining < EPSILON:
-                break  # Потребность закрыта на этом уровне приоритета
+            # Создаём агрегированные строки результата (одна на склад)
+            for acc in accumulators.values():
+                if acc.total_qty < EPSILON:
+                    continue
+                self._allocation_buffer.append(AllocationResult(
+                    session_id=self.session_id,
+                    requirement_id=req.id,
+                    work_id=work.id,
+                    material_id=material.id,
+                    istochnik="sklad",
+                    warehouse_id=acc.warehouse_id,
+                    kolichestvo=acc.total_qty,
+                    srednyaya_stoimost=acc.avg_cost,
+                    summa=acc.total_sum,
+                    tip_raspredeleniya=acc.tip,
+                    is_possible=False,
+                ))
 
         return remaining
+
+    # =========================================================================
+    # Фаза 1б: Возможное движение из других филиалов (НЕ фактическое)
+    # =========================================================================
+
+    def _record_possible_from_other_filial(
+        self,
+        req: Requirement,
+        work: Work,
+        material: Material,
+        remaining: Decimal,
+    ) -> None:
+        """
+        Показать возможное покрытие из складов других филиалов.
+
+        Что делаем:
+            • Смотрим на группу "prochee" (другой филиал)
+            • НЕ уменьшаем остатки (is_possible=True)
+            • Показываем: сколько могли бы взять при межфилиальном переводе
+            • Сумма показывается для оценки стоимости возможного переброса
+
+        remaining — сколько ещё не покрыто после своих складов.
+        Показываем не больше этого количества.
+        """
+        batches_by_priority = self.batch_repo.get_available_by_warehouse_priority(
+            material_id=material.id,
+            zavod=work.zavod,
+            filial=work.filial,
+        )
+
+        possible_batches = batches_by_priority["prochee"]
+        if not possible_batches:
+            return
+
+        # Накопители по складу-источнику
+        accumulators: dict[int, _WarehouseAccumulator] = {}
+        possible_remaining = remaining  # Сколько ещё можно было бы взять
+
+        for batch in possible_batches:  # FIFO
+            if possible_remaining < EPSILON:
+                break
+
+            # Берём фактический остаток партии (не трогаем кэш — мы не распределяем)
+            available = batch.dostupno
+            if available < EPSILON:
+                continue
+
+            # Показываем не больше того, сколько ещё нужно работе
+            qty = min(possible_remaining, available).quantize(Decimal("0.0001"), rounding=ROUND_DOWN)
+            if qty < EPSILON:
+                continue
+
+            cost = batch.stoimost_za_ed or Decimal("0")
+
+            wh_id = batch.warehouse_id
+            if wh_id not in accumulators:
+                accumulators[wh_id] = _WarehouseAccumulator(
+                    warehouse_id=wh_id,
+                    is_possible=True,
+                    tip="vozmozhnoe",
+                )
+            accumulators[wh_id].add(qty, cost)
+            possible_remaining -= qty
+
+            self._stats["possible_warehouse"] += 1
+
+        # Создаём строки «возможного» распределения (агрегированно по складу)
+        for acc in accumulators.values():
+            if acc.total_qty < EPSILON:
+                continue
+            self._allocation_buffer.append(AllocationResult(
+                session_id=self.session_id,
+                requirement_id=req.id,
+                work_id=work.id,
+                material_id=material.id,
+                istochnik="vozmozhnoe_sklad",
+                warehouse_id=acc.warehouse_id,
+                kolichestvo=acc.total_qty,
+                srednyaya_stoimost=acc.avg_cost,
+                summa=acc.total_sum,
+                tip_raspredeleniya="vozmozhnoe",
+                is_possible=True,
+            ))
+
+            logger.debug(
+                "  [возможное] склад=%d qty=%.4f avg_cost=%.2f",
+                acc.warehouse_id, acc.total_qty, acc.avg_cost,
+            )
 
     # =========================================================================
     # Фаза 2: Поставки
@@ -317,12 +429,7 @@ class AllocationEngine:
         material: Material,
         remaining: Decimal,
     ) -> Decimal:
-        """
-        Зарезервировать материал из ожидаемых поставок.
-
-        Returns:
-            Остаток потребности после резервирования из поставок
-        """
+        """Зарезервировать материал из ожидаемых поставок."""
         supply_lines = self.supply_repo.get_available_lines_for_material(
             material_id=material.id,
         )
@@ -335,18 +442,14 @@ class AllocationEngine:
             if available < EPSILON:
                 continue
 
-            qty_to_allocate = min(remaining, available).quantize(
-                Decimal("0.0001"), rounding=ROUND_DOWN
-            )
-
-            if qty_to_allocate < EPSILON:
+            qty = min(remaining, available).quantize(Decimal("0.0001"), rounding=ROUND_DOWN)
+            if qty < EPSILON:
                 continue
 
-            # Обновляем кэш поставок
-            self._supply_cache[line.id] = available - qty_to_allocate
+            self._supply_cache[line.id] = available - qty
 
-            cost_per_unit = line.stoimost_za_ed or Decimal("0")
-            total_cost = (qty_to_allocate * cost_per_unit).quantize(Decimal("0.01"))
+            cost = line.stoimost_za_ed or Decimal("0")
+            total = (qty * cost).quantize(Decimal("0.01"))
 
             self._allocation_buffer.append(AllocationResult(
                 session_id=self.session_id,
@@ -354,22 +457,18 @@ class AllocationEngine:
                 work_id=work.id,
                 material_id=material.id,
                 istochnik="postavka",
-                warehouse_id=line.supply.warehouse_id if line.supply else None,
                 supply_line_id=line.id,
-                kolichestvo=qty_to_allocate,
-                stoimost_za_ed=cost_per_unit,
-                summa=total_cost,
+                warehouse_id=line.supply.warehouse_id if line.supply else None,
+                kolichestvo=qty,
+                srednyaya_stoimost=cost,
+                summa=total,
                 tip_raspredeleniya=None,
+                is_possible=False,
             ))
 
-            req.raspredeleno += qty_to_allocate
-            remaining -= qty_to_allocate
-            self._stats["allocated_from_supply"] += 1
-
-            logger.debug(
-                "  Поставка: строка #%s, зарезервировано=%.4f",
-                line.id, qty_to_allocate,
-            )
+            req.raspredeleno += qty
+            remaining -= qty
+            self._stats["allocated_supply"] += 1
 
         return remaining
 
@@ -384,29 +483,21 @@ class AllocationEngine:
         material: Material,
         deficit_qty: Decimal,
     ) -> None:
-        """
-        Зафиксировать дефицит — потребность, которую не удалось покрыть.
-
-        Эти записи используются для формирования плана закупок.
-        """
-        # Оцениваем стоимость дефицита (если нет цены — 0)
-        estimated_cost = Decimal("0")  # TODO: брать из последней цены материала
-
+        """Зафиксировать дефицит — позиция «К закупу»."""
         self._deficit_buffer.append(DeficitRecord(
             session_id=self.session_id,
             requirement_id=req.id,
             work_id=work.id,
             material_id=material.id,
             deficit_qty=deficit_qty,
-            estimated_cost=estimated_cost,
+            estimated_cost=Decimal("0"),
             needed_by=work.data_okonchaniya,
         ))
-
         req.deficit = deficit_qty
         self._stats["deficit_records"] += 1
 
         logger.debug(
-            "  ДЕФИЦИТ: работа=%s, материал=%s, количество=%.4f",
+            "  [дефицит] %s | %s | qty=%.4f",
             work.kod_raboty, material.sys_nomer, deficit_qty,
         )
 
@@ -415,71 +506,43 @@ class AllocationEngine:
     # =========================================================================
 
     def _get_batch_available(self, batch: StockBatch) -> Decimal:
-        """
-        Получить актуальное доступное количество партии из кэша.
-
-        Кэш инициализируется из поля batch.dostupno при первом обращении.
-        Дальше — только из кэша (без обращения к БД).
-        """
+        """Актуальное доступное количество партии (из кэша)."""
         if batch.id not in self._batch_cache:
             self._batch_cache[batch.id] = batch.dostupno
         return self._batch_cache[batch.id]
 
     def _get_supply_available(self, line: SupplyLine) -> Decimal:
-        """Получить актуальное доступное количество строки поставки из кэша."""
+        """Актуальное доступное количество строки поставки (из кэша)."""
         if line.id not in self._supply_cache:
             self._supply_cache[line.id] = line.dostupno
         return self._supply_cache[line.id]
 
     def _flush_buffers_to_db(self) -> None:
-        """
-        Записать все накопленные результаты в БД одним batch insert.
-
-        Почему не сохраняли по одной строке?
-            Каждый session.add() + commit() — это отдельный сетевой запрос к БД.
-            При 100 000 строк это 100 000 запросов — медленно!
-            bulk_save_objects() отправляет всё одним запросом — в 100x быстрее.
-        """
+        """Записать все накопленные результаты в БД одним batch insert."""
         if self._allocation_buffer:
             self.session.bulk_save_objects(self._allocation_buffer)
-            logger.info("Сохранено строк распределения: %d", len(self._allocation_buffer))
+            logger.info("Строк распределения (факт + возможное): %d", len(self._allocation_buffer))
 
         if self._movement_buffer:
             self.session.bulk_save_objects(self._movement_buffer)
-            logger.info("Сохранено движений склада: %d", len(self._movement_buffer))
+            logger.info("Движений склада (фактических): %d", len(self._movement_buffer))
 
         if self._deficit_buffer:
             self.session.bulk_save_objects(self._deficit_buffer)
-            logger.info("Сохранено записей дефицита: %d", len(self._deficit_buffer))
+            logger.info("Записей дефицита: %d", len(self._deficit_buffer))
 
-        self.session.flush()
-
-    def _update_requirement_totals(self) -> None:
-        """
-        Обновляем поля raspredeleno и deficit в таблице requirements.
-
-        В процессе работы мы меняли req.raspredeleno в памяти.
-        Теперь нужно записать эти значения в БД.
-        """
-        # SQLAlchemy сам отслеживает изменения в ORM-объектах (unit of work pattern).
-        # После flush() все изменённые объекты будут записаны автоматически.
         self.session.flush()
 
     def _update_availability_in_db(self) -> None:
-        """
-        Обновить поля dostupno в stock_batches и supply_lines.
-
-        Синхронизируем кэш (который менялся в памяти) с реальными данными в БД.
-        """
-        # Обновляем партии
+        """Обновить поля dostupno в stock_batches и supply_lines."""
         for batch_id, new_available in self._batch_cache.items():
             batch = self.session.get(StockBatch, batch_id)
             if batch is not None:
                 batch.dostupno = new_available
 
-        # Обновляем строки поставок
         for line_id, new_available in self._supply_cache.items():
-            line = self.session.get(SupplyLine, line_id)
+            from app.db.models import SupplyLine as SL
+            line = self.session.get(SL, line_id)
             if line is not None:
                 line.dostupno = new_available
 
@@ -490,22 +553,15 @@ class AllocationEngine:
         )
 
     def _create_session_record(self) -> AllocationSession:
-        """Создать запись о сессии распределения в БД."""
-        allocation_session = AllocationSession(
-            id=self.session_id,
-            status="running",
-        )
-        self.session.add(allocation_session)
+        alloc_session = AllocationSession(id=self.session_id, status="running")
+        self.session.add(alloc_session)
         self.session.flush()
-        return allocation_session
+        return alloc_session
 
-    def _complete_session(self, allocation_session: AllocationSession) -> AllocationSession:
-        """Обновить запись сессии после завершения распределения."""
-        allocation_session.status = "completed"
-        allocation_session.completed_at = datetime.now()
-        allocation_session.total_requirements = self._stats["requirements_processed"]
-        allocation_session.total_allocated = (
-            self._stats["allocated_from_warehouse"] + self._stats["allocated_from_supply"]
-        )
-        allocation_session.total_deficit = self._stats["deficit_records"]
-        return allocation_session
+    def _complete_session(self, alloc_session: AllocationSession) -> AllocationSession:
+        alloc_session.status = "completed"
+        alloc_session.completed_at = datetime.now()
+        alloc_session.total_requirements = self._stats["requirements_processed"]
+        alloc_session.total_allocated = self._stats["allocated_warehouse"] + self._stats["allocated_supply"]
+        alloc_session.total_deficit = self._stats["deficit_records"]
+        return alloc_session

@@ -1,21 +1,32 @@
 """
-app/services/export_service.py — Экспорт результатов в Excel
+app/services/export_service.py — Экспорт результатов распределения в Excel
 
-Что делает этот модуль?
-    Берёт результаты распределения из PostgreSQL и формирует Excel-отчёты.
-    Каждый тип результата — отдельный лист в одном Excel файле.
+Структура Excel-отчёта (6 листов):
+──────────────────────────────────────────────────────────────────────────────
+  Лист 1: «Распределение (факт)»
+      Фактически распределённые материалы — со складов своего завода/филиала
+      и из поставок. Одна строка = один склад + одна работа + один материал.
+      Стоимость = средняя взвешенная по всем партиям склада.
 
-Структура Excel-отчёта:
-    Лист 1: "Распределение"   — что, кому, откуда, по какой цене
-    Лист 2: "Движение склада" — расходы по складам и партиям
-    Лист 3: "Дефицит"         — чего не хватает, сколько нужно закупить
-    Лист 4: "Обеспечённость"  — % обеспечённости по работам и филиалам
+  Лист 2: «Возможное движение»
+      Материалы других филиалов, которые могли бы покрыть дефицит.
+      НЕ распределены фактически — требуют согласования переброса.
+      Одна строка = один чужой склад + одна работа + один материал.
 
-Зачем pandas для экспорта?
-    pandas.DataFrame.to_excel() умеет:
-    - Создавать несколько листов в одном файле
-    - Применять форматирование (ширина колонок)
-    - Работать с большими объёмами данных эффективно
+  Лист 3: «Движение склада»
+      Детальный расход: с какого склада, на какую работу,
+      какой материал, какое количество.
+      Только фактические списания (not is_possible).
+
+  Лист 4: «Остатки складов»
+      Текущие остатки по складам ПОСЛЕ распределения.
+      Показывает: начальный остаток → распределено → остаток.
+
+  Лист 5: «Дефицит»
+      Позиции «К закупу»: что не покрыто ни складом, ни поставками.
+
+  Лист 6: «Обеспечённость»
+      % покрытия каждой потребности.
 """
 
 from datetime import datetime
@@ -32,213 +43,355 @@ from app.db.database import get_session
 logger = get_logger(__name__)
 
 
-def export_allocation_results(session_id: str, output_dir: Optional[str] = None) -> Path:
+def export_allocation_results(
+    session_id: str,
+    output_dir: Optional[str] = None,
+) -> Path:
     """
-    Экспортировать все результаты сессии распределения в Excel.
+    Сформировать Excel-отчёт по результатам сессии распределения.
 
     Args:
-        session_id: ID сессии распределения (например "20260523_143000_abc12")
-        output_dir: Папка для сохранения файла (по умолчанию из settings)
+        session_id: ID сессии распределения
+        output_dir: Папка для сохранения (по умолчанию из settings)
 
     Returns:
-        Путь к созданному Excel файлу
+        Путь к созданному .xlsx файлу
     """
-
     out_dir = Path(output_dir or settings.export_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    # Имя файла включает ID сессии и дату/время создания
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     file_path = out_dir / f"maps_results_{session_id}_{timestamp}.xlsx"
 
-    logger.info("Формирование Excel отчёта для сессии: %s", session_id)
+    logger.info("Формирование Excel-отчёта | сессия: %s", session_id)
 
     with get_session() as session:
-        # Используем pandas + SQL-запросы для эффективной выборки больших данных
+        df_fact       = _get_fact_allocation_df(session, session_id)
+        df_possible   = _get_possible_allocation_df(session, session_id)
+        df_movement   = _get_movement_df(session, session_id)
+        df_balances   = _get_warehouse_balances_df(session, session_id)
+        df_deficit    = _get_deficit_df(session, session_id)
+        df_coverage   = _get_coverage_df(session)
 
-        # --- Лист 1: Распределение ---
-        df_allocation = _get_allocation_df(session, session_id)
-
-        # --- Лист 2: Движение склада ---
-        df_movements = _get_movements_df(session, session_id)
-
-        # --- Лист 3: Дефицит ---
-        df_deficit = _get_deficit_df(session, session_id)
-
-        # --- Лист 4: Обеспечённость ---
-        df_coverage = _get_coverage_df(session, session_id)
-
-    # Записываем всё в один Excel файл с несколькими листами
-    # ExcelWriter — объект для записи нескольких листов в один файл
     with pd.ExcelWriter(file_path, engine="openpyxl") as writer:
-        _write_sheet(writer, df_allocation, "Распределение")
-        _write_sheet(writer, df_movements, "Движение склада")
-        _write_sheet(writer, df_deficit, "Дефицит")
+        _write_sheet(writer, df_fact,     "Распределение (факт)")
+        _write_sheet(writer, df_possible, "Возможное движение")
+        _write_sheet(writer, df_movement, "Движение склада")
+        _write_sheet(writer, df_balances, "Остатки складов")
+        _write_sheet(writer, df_deficit,  "Дефицит")
         _write_sheet(writer, df_coverage, "Обеспеченность")
 
     logger.info(
-        "Excel отчёт создан: %s (строк: распределение=%d, дефицит=%d)",
-        file_path, len(df_allocation), len(df_deficit),
+        "Отчёт создан: %s | факт=%d, возможное=%d, дефицит=%d",
+        file_path, len(df_fact), len(df_possible), len(df_deficit),
     )
     return file_path
 
 
-def _write_sheet(writer: pd.ExcelWriter, df: pd.DataFrame, sheet_name: str) -> None:
+# =============================================================================
+# Лист 1: Фактическое распределение
+# =============================================================================
+
+def _get_fact_allocation_df(session, session_id: str) -> pd.DataFrame:
     """
-    Записать DataFrame как лист Excel с автоподбором ширины колонок.
+    Фактически распределённые материалы (sklad + postavka).
 
-    Args:
-        writer:     Открытый ExcelWriter
-        df:         Данные для записи
-        sheet_name: Название листа
-    """
-    df.to_excel(writer, sheet_name=sheet_name, index=False)
-
-    # Автоподбор ширины колонок (чтобы текст не обрезался)
-    worksheet = writer.sheets[sheet_name]
-    for col_idx, col in enumerate(df.columns, 1):
-        # Максимальная ширина: длина заголовка vs длина самого длинного значения
-        max_len = max(
-            len(str(col)),
-            df[col].astype(str).str.len().max() if not df.empty else 0,
-        )
-        # Ограничиваем: минимум 10, максимум 60 символов
-        col_width = min(max(max_len + 2, 10), 60)
-        # openpyxl использует буквы колонок (A, B, C...)
-        col_letter = worksheet.cell(1, col_idx).column_letter
-        worksheet.column_dimensions[col_letter].width = col_width
-
-
-def _get_allocation_df(session, session_id: str) -> pd.DataFrame:
-    """
-    Получить данные распределения для экспорта.
-
-    JOIN-запрос: объединяем результаты с данными работ, материалов, складов.
+    Каждая строка показывает:
+      - Какая работа получила материал
+      - Откуда (склад, договор поставки)
+      - Сколько
+      - По какой средней цене и на какую сумму
     """
     sql = text("""
         SELECT
-            ar.id                       AS "№",
-            w.kod_raboty                AS "Код работы",
-            w.filial                    AS "Филиал работы",
-            w.zavod                     AS "Завод работы",
-            w.prioritet                 AS "Приоритет",
-            w.data_nachala              AS "Дата начала",
-            w.data_okonchaniya          AS "Дата окончания",
-            m.sys_nomer                 AS "Системный номер",
-            m.naimenovanie              AS "Наименование материала",
-            m.ed_izm                    AS "Ед.изм",
-            ar.istochnik                AS "Источник",
-            wh.kod_sklada               AS "Код склада",
-            wh.filial                   AS "Филиал склада",
-            sb.nomer_partii             AS "Номер партии",
-            sb.data_postupleniya        AS "Дата поступления партии",
-            ar.tip_raspredeleniya       AS "Тип распределения",
-            ar.kolichestvo              AS "Количество",
-            ar.stoimost_za_ed           AS "Стоимость за ед",
-            ar.summa                    AS "Сумма",
-            ar.created_at               AS "Дата распределения"
+            w.prioritet                     AS "Приоритет",
+            w.kod_raboty                    AS "Код работы",
+            w.filial                        AS "Филиал работы",
+            w.zavod                         AS "Завод работы",
+            w.data_nachala                  AS "Дата начала",
+            w.data_okonchaniya              AS "Дата окончания",
+            m.sys_nomer                     AS "Системный номер",
+            m.naimenovanie                  AS "Наименование материала",
+            m.ed_izm                        AS "Ед.изм",
+            ar.istochnik                    AS "Источник",
+            ar.tip_raspredeleniya           AS "Тип распределения",
+            wh.kod_sklada                   AS "Код склада",
+            wh.filial                       AS "Филиал склада",
+            wh.zavod                        AS "Завод склада",
+            CAST(ar.kolichestvo AS NUMERIC(18,4))        AS "Количество",
+            CAST(ar.srednyaya_stoimost AS NUMERIC(18,2)) AS "Средняя цена",
+            CAST(ar.summa AS NUMERIC(18,2))              AS "Сумма"
         FROM allocation_results ar
-        JOIN works w ON ar.work_id = w.id
-        JOIN materials m ON ar.material_id = m.id
+        JOIN works     w  ON ar.work_id      = w.id
+        JOIN materials m  ON ar.material_id  = m.id
         LEFT JOIN warehouses wh ON ar.warehouse_id = wh.id
-        LEFT JOIN stock_batches sb ON ar.batch_id = sb.id
-        WHERE ar.session_id = :session_id
-        ORDER BY w.prioritet, w.data_nachala, w.kod_raboty, m.sys_nomer
+        WHERE ar.session_id = :sid
+          AND ar.is_possible = FALSE
+        ORDER BY
+            w.prioritet,
+            w.data_nachala,
+            w.kod_raboty,
+            m.sys_nomer,
+            ar.istochnik
     """)
-    result = session.execute(sql, {"session_id": session_id})
-    rows = result.fetchall()
-    return pd.DataFrame(rows, columns=result.keys())
+    rows = session.execute(sql, {"sid": session_id}).fetchall()
+    return _to_df(rows)
 
 
-def _get_movements_df(session, session_id: str) -> pd.DataFrame:
-    """Получить движения склада для экспорта."""
+# =============================================================================
+# Лист 2: Возможное движение (другой филиал)
+# =============================================================================
+
+def _get_possible_allocation_df(session, session_id: str) -> pd.DataFrame:
+    """
+    Возможное покрытие из складов других филиалов.
+
+    Эти строки НЕ являются фактическим распределением.
+    Они показывают: «Если бы разрешили межфилиальный перевод —
+    вот откуда можно взять и сколько это стоит».
+
+    Используется для принятия решений о переброске ресурсов.
+    """
     sql = text("""
         SELECT
-            wh.kod_sklada               AS "Код склада",
-            wh.filial                   AS "Филиал склада",
-            m.sys_nomer                 AS "Системный номер",
-            m.naimenovanie              AS "Наименование материала",
-            m.ed_izm                    AS "Ед.изм",
-            sb.nomer_partii             AS "Номер партии",
-            sm.izmenenie                AS "Изменение (расход)",
-            sm.ostatok                  AS "Остаток после",
-            w.kod_raboty                AS "Работа-получатель",
-            sm.data_dvizheniya          AS "Дата движения"
-        FROM stock_movements sm
-        JOIN warehouses wh ON sm.warehouse_id = wh.id
-        JOIN materials m ON sm.material_id = m.id
-        LEFT JOIN stock_batches sb ON sm.batch_id = sb.id
-        LEFT JOIN works w ON sm.work_id = w.id
-        WHERE sm.session_id = :session_id
-        ORDER BY wh.kod_sklada, m.sys_nomer, sm.data_dvizheniya
+            w.prioritet                     AS "Приоритет",
+            w.kod_raboty                    AS "Код работы",
+            w.filial                        AS "Филиал работы",
+            w.zavod                         AS "Завод работы",
+            w.data_okonchaniya              AS "Нужно к дате",
+            m.sys_nomer                     AS "Системный номер",
+            m.naimenovanie                  AS "Наименование материала",
+            m.ed_izm                        AS "Ед.изм",
+            wh.kod_sklada                   AS "Склад-источник",
+            wh.filial                       AS "Филиал склада",
+            wh.zavod                        AS "Завод склада",
+            CAST(ar.kolichestvo AS NUMERIC(18,4))        AS "Возможное кол-во",
+            CAST(ar.srednyaya_stoimost AS NUMERIC(18,2)) AS "Средняя цена",
+            CAST(ar.summa AS NUMERIC(18,2))              AS "Оценочная сумма",
+            'Требует согласования'          AS "Статус"
+        FROM allocation_results ar
+        JOIN works     w  ON ar.work_id     = w.id
+        JOIN materials m  ON ar.material_id = m.id
+        LEFT JOIN warehouses wh ON ar.warehouse_id = wh.id
+        WHERE ar.session_id = :sid
+          AND ar.is_possible = TRUE
+          AND ar.istochnik = 'vozmozhnoe_sklad'
+        ORDER BY
+            w.prioritet,
+            w.data_okonchaniya,
+            w.kod_raboty,
+            m.sys_nomer
     """)
-    result = session.execute(sql, {"session_id": session_id})
-    rows = result.fetchall()
-    return pd.DataFrame(rows, columns=result.keys())
+    rows = session.execute(sql, {"sid": session_id}).fetchall()
+    return _to_df(rows)
 
+
+# =============================================================================
+# Лист 3: Движение склада (детальное, по партиям)
+# =============================================================================
+
+def _get_movement_df(session, session_id: str) -> pd.DataFrame:
+    """
+    Детальное движение по складам — только фактические списания.
+
+    Показывает цепочку: склад → работа → материал → количество → остаток.
+    Одна строка = одна партия, списанная на одну работу.
+    Сортировка: склад → материал → дата движения.
+    """
+    sql = text("""
+        SELECT
+            wh.kod_sklada                   AS "Склад",
+            wh.filial                       AS "Филиал склада",
+            wh.zavod                        AS "Завод склада",
+            m.sys_nomer                     AS "Системный номер",
+            m.naimenovanie                  AS "Наименование материала",
+            m.ed_izm                        AS "Ед.изм",
+            sb.nomer_partii                 AS "Номер партии",
+            sb.data_postupleniya            AS "Дата поступления партии",
+            CAST(sb.kolichestvo AS NUMERIC(18,4))  AS "Нач. кол-во партии",
+            w.kod_raboty                    AS "Работа-получатель",
+            w.filial                        AS "Филиал работы",
+            w.prioritet                     AS "Приоритет работы",
+            CAST(ABS(sm.izmenenie) AS NUMERIC(18,4)) AS "Списано",
+            CAST(sm.ostatok AS NUMERIC(18,4))        AS "Остаток партии после"
+        FROM stock_movements sm
+        JOIN warehouses  wh ON sm.warehouse_id = wh.id
+        JOIN materials    m ON sm.material_id  = m.id
+        LEFT JOIN stock_batches sb ON sm.batch_id  = sb.id
+        LEFT JOIN works          w ON sm.work_id   = w.id
+        WHERE sm.session_id = :sid
+        ORDER BY
+            wh.kod_sklada,
+            m.sys_nomer,
+            sb.data_postupleniya,
+            sm.id
+    """)
+    rows = session.execute(sql, {"sid": session_id}).fetchall()
+    return _to_df(rows)
+
+
+# =============================================================================
+# Лист 4: Остатки складов после распределения
+# =============================================================================
+
+def _get_warehouse_balances_df(session, session_id: str) -> pd.DataFrame:
+    """
+    Остатки по складам ПОСЛЕ распределения.
+
+    Показывает для каждого материала на каждом складе:
+      • Начальный остаток (до распределения) = kolichestvo
+      • Фактически распределено в этой сессии
+      • Остаток после = dostupno (уже обновлено движком)
+
+    Используется для контроля: что осталось на складах.
+    """
+    sql = text("""
+        SELECT
+            wh.kod_sklada                       AS "Склад",
+            wh.filial                           AS "Филиал склада",
+            wh.zavod                            AS "Завод склада",
+            m.sys_nomer                         AS "Системный номер",
+            m.naimenovanie                      AS "Наименование материала",
+            m.ed_izm                            AS "Ед.изм",
+            m.gruppa                            AS "Группа",
+            sb.nomer_partii                     AS "Номер партии",
+            sb.data_postupleniya                AS "Дата поступления",
+            CAST(sb.kolichestvo AS NUMERIC(18,4))   AS "Нач. остаток",
+            CAST(sb.kolichestvo - sb.dostupno AS NUMERIC(18,4)) AS "Распределено",
+            CAST(sb.dostupno    AS NUMERIC(18,4))   AS "Текущий остаток",
+            CAST(sb.stoimost_za_ed AS NUMERIC(18,2)) AS "Цена за ед.",
+            CAST(sb.dostupno * sb.stoimost_za_ed AS NUMERIC(18,2)) AS "Сумма остатка"
+        FROM stock_batches sb
+        JOIN warehouses wh ON sb.warehouse_id = wh.id
+        JOIN materials   m ON sb.material_id  = m.id
+        ORDER BY
+            wh.kod_sklada,
+            m.sys_nomer,
+            sb.data_postupleniya
+    """)
+    # Параметр session_id не используется — остатки глобальные, не привязаны к сессии.
+    # Но метод принимает его для единообразия API.
+    rows = session.execute(sql).fetchall()
+    return _to_df(rows)
+
+
+# =============================================================================
+# Лист 5: Дефицит
+# =============================================================================
 
 def _get_deficit_df(session, session_id: str) -> pd.DataFrame:
-    """Получить дефицит для экспорта."""
+    """
+    Позиции дефицита — что нужно закупить.
+
+    Включает только те потребности, которые не были покрыты
+    ни складом, ни поставками (ни фактически, ни как возможное).
+    """
     sql = text("""
         SELECT
-            w.kod_raboty                AS "Код работы",
-            w.filial                    AS "Филиал",
-            w.zavod                     AS "Завод",
-            w.prioritet                 AS "Приоритет",
-            m.sys_nomer                 AS "Системный номер",
-            m.naimenovanie              AS "Наименование материала",
-            m.ed_izm                    AS "Ед.изм",
-            d.deficit_qty               AS "Объем дефицита",
-            d.estimated_cost            AS "Оценочная стоимость",
-            d.needed_by                 AS "Нужно к дате",
-            'К закупу'                  AS "Статус"
+            w.prioritet                     AS "Приоритет",
+            w.kod_raboty                    AS "Код работы",
+            w.filial                        AS "Филиал работы",
+            w.zavod                         AS "Завод работы",
+            m.sys_nomer                     AS "Системный номер",
+            m.naimenovanie                  AS "Наименование материала",
+            m.ed_izm                        AS "Ед.изм",
+            CAST(r.potrebnost AS NUMERIC(18,4))    AS "Потребность",
+            CAST(r.raspredeleno AS NUMERIC(18,4))  AS "Распределено (факт)",
+            CAST(d.deficit_qty AS NUMERIC(18,4))   AS "Дефицит (к закупу)",
+            d.needed_by                     AS "Нужно к дате",
+            'К закупу'                      AS "Статус"
         FROM deficit_records d
-        JOIN works w ON d.work_id = w.id
-        JOIN materials m ON d.material_id = m.id
-        WHERE d.session_id = :session_id
-        ORDER BY w.prioritet, d.needed_by, m.sys_nomer
+        JOIN works       w ON d.work_id     = w.id
+        JOIN materials   m ON d.material_id = m.id
+        JOIN requirements r ON d.requirement_id = r.id
+        WHERE d.session_id = :sid
+        ORDER BY
+            w.prioritet,
+            d.needed_by,
+            m.sys_nomer
     """)
-    result = session.execute(sql, {"session_id": session_id})
-    rows = result.fetchall()
-    return pd.DataFrame(rows, columns=result.keys())
+    rows = session.execute(sql, {"sid": session_id}).fetchall()
+    return _to_df(rows)
 
 
-def _get_coverage_df(session, session_id: str) -> pd.DataFrame:  # noqa: ARG001 — session_id зарезервирован для фильтрации по сценарию
+# =============================================================================
+# Лист 6: Обеспечённость
+# =============================================================================
+
+def _get_coverage_df(session) -> pd.DataFrame:
     """
-    Сформировать отчёт об обеспечённости работ.
+    Сводный отчёт обеспечённости каждой работы.
 
-    Обеспечённость = (распределено / потребность) * 100%.
-    Группируем по работам и считаем % закрытия по каждому материалу.
+    Обеспечённость % = распределено / потребность × 100
+    Включает как фактическое, так и возможное (для анализа).
     """
     sql = text("""
         SELECT
+            w.prioritet                         AS "Приоритет",
             w.kod_raboty                        AS "Код работы",
             w.filial                            AS "Филиал",
-            w.prioritet                         AS "Приоритет",
+            w.zavod                             AS "Завод",
             w.data_okonchaniya                  AS "Дата окончания",
             m.sys_nomer                         AS "Системный номер",
             m.naimenovanie                      AS "Наименование",
             m.ed_izm                            AS "Ед.изм",
-            r.potrebnost                        AS "Потребность",
-            r.raspredeleno                      AS "Распределено",
-            r.deficit                           AS "Дефицит",
+            CAST(r.potrebnost   AS NUMERIC(18,4))  AS "Потребность",
+            CAST(r.raspredeleno AS NUMERIC(18,4))  AS "Распределено (факт)",
+            CAST(r.deficit      AS NUMERIC(18,4))  AS "Дефицит",
             CASE
                 WHEN r.potrebnost > 0
                 THEN ROUND(r.raspredeleno / r.potrebnost * 100, 1)
                 ELSE 0
             END                                 AS "% обеспеченности",
             CASE
-                WHEN r.deficit = 0 THEN 'Обеспечено'
-                WHEN r.raspredeleno = 0 THEN 'Не обеспечено'
+                WHEN r.deficit = 0              THEN 'Обеспечено'
+                WHEN r.raspredeleno = 0         THEN 'Не обеспечено'
                 ELSE 'Частично обеспечено'
-            END                                 AS "Статус обеспеченности"
+            END                                 AS "Статус"
         FROM requirements r
-        JOIN works w ON r.work_id = w.id
+        JOIN works     w ON r.work_id     = w.id
         JOIN materials m ON r.material_id = m.id
-        ORDER BY w.prioritet, w.data_okonchaniya, w.kod_raboty, m.sys_nomer
+        ORDER BY
+            w.prioritet,
+            w.data_okonchaniya,
+            w.kod_raboty,
+            m.sys_nomer
     """)
-    result = session.execute(sql)
-    rows = result.fetchall()
-    return pd.DataFrame(rows, columns=result.keys())
+    rows = session.execute(sql).fetchall()
+    return _to_df(rows)
 
 
+# =============================================================================
+# Вспомогательные функции
+# =============================================================================
+
+def _to_df(rows) -> pd.DataFrame:
+    """Преобразовать результат SQL-запроса в DataFrame."""
+    if not rows:
+        return pd.DataFrame()
+    return pd.DataFrame(rows, columns=list(rows[0]._fields))
+
+
+def _write_sheet(writer: pd.ExcelWriter, df: pd.DataFrame, sheet_name: str) -> None:
+    """
+    Записать DataFrame в лист Excel с автоподбором ширины колонок.
+
+    Если DataFrame пустой — создаём лист с заголовком «Нет данных».
+    """
+    if df.empty:
+        pd.DataFrame({"Информация": ["Нет данных для этой сессии"]}).to_excel(
+            writer, sheet_name=sheet_name, index=False
+        )
+        return
+
+    df.to_excel(writer, sheet_name=sheet_name, index=False)
+
+    # Автоподбор ширины колонок
+    ws = writer.sheets[sheet_name]
+    for col_idx, col_name in enumerate(df.columns, 1):
+        max_len = max(
+            len(str(col_name)),
+            df[col_name].astype(str).str.len().max() if not df.empty else 0,
+        )
+        col_width = min(max(int(max_len) + 2, 10), 65)
+        ws.column_dimensions[ws.cell(1, col_idx).column_letter].width = col_width

@@ -421,21 +421,32 @@ class AllocationResult(Base):
     work_id: Mapped[int] = mapped_column(ForeignKey("works.id"), nullable=False)
     material_id: Mapped[int] = mapped_column(ForeignKey("materials.id"), nullable=False)
 
-    # Источник материала
-    istochnik: Mapped[str] = mapped_column(String(50))  # "sklad" | "postavka" | "zakup"
+    # Источник материала:
+    #   "sklad"            — фактически распределено со склада (тот же завод или филиал)
+    #   "vozmozhnoe_sklad" — возможное распределение (другой филиал, требует согласования)
+    #   "postavka"         — зарезервировано из поставки "в пути"
+    #   "zakup"            — дефицит, нужно закупить
+    istochnik: Mapped[str] = mapped_column(String(50))
 
     # Откуда взяли (если со склада/поставки)
     warehouse_id: Mapped[int | None] = mapped_column(ForeignKey("warehouses.id"))
     supply_line_id: Mapped[int | None] = mapped_column(ForeignKey("supply_lines.id"))
-    batch_id: Mapped[int | None] = mapped_column(ForeignKey("stock_batches.id"))
 
-    # Сколько и по какой цене
+    # Сколько и по какой СРЕДНЕЙ цене.
+    # Средняя взвешенная = sum(qty_i * price_i) / sum(qty_i) по всем партиям с одного склада.
+    # Почему средняя, а не цена конкретной партии?
+    #   На одном складе может быть несколько партий с разными ценами.
+    #   Для работы важна итоговая стоимость, а не разбивка по партиям.
     kolichestvo: Mapped[Decimal] = mapped_column(Numeric(18, 4), default=0)
-    stoimost_za_ed: Mapped[Decimal] = mapped_column(Numeric(18, 4), default=0)
-    summa: Mapped[Decimal] = mapped_column(Numeric(18, 4), default=0)  # = kolichestvo * stoimost_za_ed
+    srednyaya_stoimost: Mapped[Decimal] = mapped_column(Numeric(18, 4), default=0)
+    summa: Mapped[Decimal] = mapped_column(Numeric(18, 4), default=0)  # = kolichestvo * srednyaya_stoimost
 
-    # Приоритет склада: "zavod" (тот же завод), "filial" (тот же филиал), "prochee"
+    # Приоритет склада: "zavod" (тот же завод), "filial" (тот же филиал), "vozmozhnoe" (другой филиал)
     tip_raspredeleniya: Mapped[str | None] = mapped_column(String(50))
+
+    # True = возможное (не фактическое) распределение — материал другого филиала
+    # False = фактическое распределение (остатки реально уменьшены)
+    is_possible: Mapped[bool] = mapped_column(default=False)
 
     created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
 
