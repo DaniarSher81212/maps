@@ -1,0 +1,481 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>MAPS — Распределение материалов</title>
+    <!-- Bootstrap 5 — готовые стили и компоненты (кнопки, таблицы, карточки) -->
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet">
+    <!-- Bootstrap Icons — иконки -->
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap-icons@1.11.3/font/bootstrap-icons.css" rel="stylesheet">
+    <style>
+        body { background-color: #f8f9fa; }
+
+        /* Навбар */
+        .navbar-brand { font-weight: 700; font-size: 1.3rem; letter-spacing: 0.05em; }
+
+        /* Карточки статуса */
+        .stat-card { border: none; border-radius: 12px; box-shadow: 0 2px 8px rgba(0,0,0,.08); }
+        .stat-card .display-6 { font-weight: 700; }
+
+        /* Таблица сессий */
+        .sessions-table td { vertical-align: middle; }
+        .badge-running  { background-color: #ffc107; color: #000; }
+        .badge-completed{ background-color: #198754; }
+        .badge-failed   { background-color: #dc3545; }
+
+        /* Кнопка «Запустить распределение» */
+        .btn-allocate { font-size: 1.1rem; padding: 0.6rem 2rem; border-radius: 8px; }
+
+        /* Спиннер внутри кнопки */
+        .spinner-border-sm { width: 1rem; height: 1rem; }
+
+        /* Секция импорта */
+        .import-card { border: none; border-radius: 10px; box-shadow: 0 1px 4px rgba(0,0,0,.07); }
+        .import-card .card-header { background: #fff; border-bottom: 1px solid #eee; font-weight: 600; }
+
+        /* Прогресс загрузки файла */
+        .upload-result { font-size: 0.85rem; margin-top: 0.4rem; }
+    </style>
+</head>
+<body>
+
+<!-- =============================== НАВБАР ================================ -->
+<nav class="navbar navbar-dark bg-dark px-4 py-3 mb-4 shadow-sm">
+    <span class="navbar-brand">
+        <i class="bi bi-boxes me-2"></i>MAPS
+        <small class="text-secondary fw-normal fs-6 ms-2">Material Allocation & Planning System</small>
+    </span>
+    <span class="text-secondary small" id="server-time"></span>
+</nav>
+
+<div class="container-fluid px-4">
+
+    <!-- =========================== КАРТОЧКИ СТАТУСА ==================== -->
+    <div class="row g-3 mb-4" id="status-cards">
+        <!-- Заполняются через JavaScript (fetch /api/status) -->
+        <div class="col-6 col-md-3">
+            <div class="stat-card card p-3 h-100">
+                <div class="text-muted small mb-1"><i class="bi bi-briefcase me-1"></i>Активных работ</div>
+                <div class="display-6" id="stat-works">—</div>
+            </div>
+        </div>
+        <div class="col-6 col-md-3">
+            <div class="stat-card card p-3 h-100">
+                <div class="text-muted small mb-1"><i class="bi bi-box-seam me-1"></i>Материалов</div>
+                <div class="display-6" id="stat-materials">—</div>
+            </div>
+        </div>
+        <div class="col-6 col-md-3">
+            <div class="stat-card card p-3 h-100">
+                <div class="text-muted small mb-1"><i class="bi bi-building me-1"></i>Партий на складе</div>
+                <div class="display-6" id="stat-batches">—</div>
+            </div>
+        </div>
+        <div class="col-6 col-md-3">
+            <div class="stat-card card p-3 h-100">
+                <div class="text-muted small mb-1"><i class="bi bi-clock-history me-1"></i>Последний запуск</div>
+                <div class="fs-6 fw-semibold mt-1" id="stat-last-session">—</div>
+            </div>
+        </div>
+    </div>
+
+    <div class="row g-4">
+
+        <!-- ====================== ЛЕВАЯ КОЛОНКА: ЗАПУСК + СЕССИИ ======= -->
+        <div class="col-lg-7">
+
+            <!-- Кнопка запуска -->
+            <div class="card border-0 shadow-sm rounded-3 mb-4">
+                <div class="card-body p-4">
+                    <h5 class="card-title mb-3"><i class="bi bi-play-circle me-2 text-success"></i>Распределение материалов</h5>
+                    <p class="text-muted small mb-3">
+                        Алгоритм обработает все активные работы по 5 слоям покрытия:
+                        списание → выдано → склад → поставки → дефицит.
+                    </p>
+                    <button id="btn-allocate" class="btn btn-success btn-allocate" onclick="runAllocation()">
+                        <i class="bi bi-lightning-charge-fill me-2"></i>Запустить распределение
+                    </button>
+                    <div id="allocate-status" class="mt-3 d-none">
+                        <div class="alert alert-info py-2 mb-0">
+                            <span class="spinner-border spinner-border-sm me-2"></span>
+                            Распределение выполняется... Таблица обновляется автоматически.
+                        </div>
+                    </div>
+                    <div id="allocate-done" class="mt-3 d-none">
+                        <div class="alert alert-success py-2 mb-0">
+                            <i class="bi bi-check-circle-fill me-2"></i>
+                            Распределение завершено. Скачайте отчёт из таблицы ниже.
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Таблица сессий -->
+            <div class="card border-0 shadow-sm rounded-3">
+                <div class="card-header bg-white border-bottom py-3 d-flex justify-content-between align-items-center">
+                    <h6 class="mb-0"><i class="bi bi-table me-2"></i>История запусков</h6>
+                    <button class="btn btn-sm btn-outline-secondary" onclick="loadSessions()">
+                        <i class="bi bi-arrow-clockwise"></i> Обновить
+                    </button>
+                </div>
+                <div class="card-body p-0">
+                    <div class="table-responsive">
+                        <table class="table sessions-table mb-0 small">
+                            <thead class="table-light">
+                                <tr>
+                                    <th>Время</th>
+                                    <th>Статус</th>
+                                    <th class="text-end">Потребностей</th>
+                                    <th class="text-end">Дефицит</th>
+                                    <th class="text-center">Отчёт</th>
+                                </tr>
+                            </thead>
+                            <tbody id="sessions-tbody">
+                                <tr>
+                                    <td colspan="5" class="text-center text-muted py-4">
+                                        <span class="spinner-border spinner-border-sm me-2"></span>Загрузка...
+                                    </td>
+                                </tr>
+                            </tbody>
+                        </table>
+                    </div>
+                </div>
+            </div>
+
+        </div>
+
+        <!-- ====================== ПРАВАЯ КОЛОНКА: ИМПОРТ ФАЙЛОВ ======== -->
+        <div class="col-lg-5">
+            <div class="card border-0 shadow-sm rounded-3">
+                <div class="card-header bg-white border-bottom py-3">
+                    <h6 class="mb-0"><i class="bi bi-upload me-2"></i>Импорт данных из Excel</h6>
+                </div>
+                <div class="card-body p-3">
+
+                    <!-- Аккордеон с формами загрузки файлов -->
+                    <div class="accordion accordion-flush" id="importAccordion">
+
+                        <!-- Потребности -->
+                        <div class="accordion-item import-card mb-2 rounded-3 overflow-hidden">
+                            <h2 class="accordion-header">
+                                <button class="accordion-button collapsed py-2" type="button"
+                                        data-bs-toggle="collapse" data-bs-target="#imp-req">
+                                    <i class="bi bi-file-earmark-spreadsheet me-2 text-primary"></i>
+                                    Потребности в материалах
+                                </button>
+                            </h2>
+                            <div id="imp-req" class="accordion-collapse collapse">
+                                <div class="accordion-body py-2">
+                                    <input type="file" class="form-control form-control-sm" accept=".xlsx,.xls"
+                                           onchange="uploadFile(this, '/api/import/requirements', 'res-req')">
+                                    <div id="res-req" class="upload-result"></div>
+                                </div>
+                            </div>
+                        </div>
+
+                        <!-- Аварийные работы -->
+                        <div class="accordion-item import-card mb-2 rounded-3 overflow-hidden">
+                            <h2 class="accordion-header">
+                                <button class="accordion-button collapsed py-2" type="button"
+                                        data-bs-toggle="collapse" data-bs-target="#imp-emrg">
+                                    <i class="bi bi-exclamation-triangle me-2 text-danger"></i>
+                                    Аварийные работы
+                                </button>
+                            </h2>
+                            <div id="imp-emrg" class="accordion-collapse collapse">
+                                <div class="accordion-body py-2">
+                                    <input type="file" class="form-control form-control-sm" accept=".xlsx,.xls"
+                                           onchange="uploadFile(this, '/api/import/emergency', 'res-emrg')">
+                                    <div id="res-emrg" class="upload-result"></div>
+                                </div>
+                            </div>
+                        </div>
+
+                        <!-- Складские остатки -->
+                        <div class="accordion-item import-card mb-2 rounded-3 overflow-hidden">
+                            <h2 class="accordion-header">
+                                <button class="accordion-button collapsed py-2" type="button"
+                                        data-bs-toggle="collapse" data-bs-target="#imp-stock">
+                                    <i class="bi bi-archive me-2 text-warning"></i>
+                                    Складские остатки
+                                </button>
+                            </h2>
+                            <div id="imp-stock" class="accordion-collapse collapse">
+                                <div class="accordion-body py-2">
+                                    <input type="file" class="form-control form-control-sm" accept=".xlsx,.xls"
+                                           onchange="uploadFile(this, '/api/import/stock', 'res-stock')">
+                                    <div id="res-stock" class="upload-result"></div>
+                                </div>
+                            </div>
+                        </div>
+
+                        <!-- Поставки -->
+                        <div class="accordion-item import-card mb-2 rounded-3 overflow-hidden">
+                            <h2 class="accordion-header">
+                                <button class="accordion-button collapsed py-2" type="button"
+                                        data-bs-toggle="collapse" data-bs-target="#imp-sup">
+                                    <i class="bi bi-truck me-2 text-info"></i>
+                                    Поставки (материалы в пути)
+                                </button>
+                            </h2>
+                            <div id="imp-sup" class="accordion-collapse collapse">
+                                <div class="accordion-body py-2">
+                                    <input type="file" class="form-control form-control-sm" accept=".xlsx,.xls"
+                                           onchange="uploadFile(this, '/api/import/supplies', 'res-sup')">
+                                    <div id="res-sup" class="upload-result"></div>
+                                </div>
+                            </div>
+                        </div>
+
+                        <!-- Списания -->
+                        <div class="accordion-item import-card mb-2 rounded-3 overflow-hidden">
+                            <h2 class="accordion-header">
+                                <button class="accordion-button collapsed py-2" type="button"
+                                        data-bs-toggle="collapse" data-bs-target="#imp-wo">
+                                    <i class="bi bi-receipt me-2 text-secondary"></i>
+                                    Фактические списания (Слой 1)
+                                </button>
+                            </h2>
+                            <div id="imp-wo" class="accordion-collapse collapse">
+                                <div class="accordion-body py-2">
+                                    <input type="file" class="form-control form-control-sm" accept=".xlsx,.xls"
+                                           onchange="uploadFile(this, '/api/import/writeoffs', 'res-wo')">
+                                    <div id="res-wo" class="upload-result"></div>
+                                </div>
+                            </div>
+                        </div>
+
+                        <!-- Выдано не списано -->
+                        <div class="accordion-item import-card rounded-3 overflow-hidden">
+                            <h2 class="accordion-header">
+                                <button class="accordion-button collapsed py-2" type="button"
+                                        data-bs-toggle="collapse" data-bs-target="#imp-iss">
+                                    <i class="bi bi-bag-check me-2 text-success"></i>
+                                    Выдано не списано (Слой 2)
+                                </button>
+                            </h2>
+                            <div id="imp-iss" class="accordion-collapse collapse">
+                                <div class="accordion-body py-2">
+                                    <input type="file" class="form-control form-control-sm" accept=".xlsx,.xls"
+                                           onchange="uploadFile(this, '/api/import/issued', 'res-iss')">
+                                    <div id="res-iss" class="upload-result"></div>
+                                </div>
+                            </div>
+                        </div>
+
+                    </div><!-- /accordion -->
+
+                    <p class="text-muted mt-3 mb-0" style="font-size:0.78rem;">
+                        <i class="bi bi-info-circle me-1"></i>
+                        Файл выбирается — импорт начинается автоматически.
+                    </p>
+                </div>
+            </div>
+        </div>
+
+    </div><!-- /row -->
+</div><!-- /container -->
+
+<div class="mt-5 py-3 text-center text-muted small border-top">
+    MAPS v2.0 &nbsp;·&nbsp; <a href="/docs" class="text-muted">API документация</a>
+</div>
+
+<!-- Bootstrap JS -->
+<script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/js/bootstrap.bundle.min.js"></script>
+
+<script>
+// ============================================================================
+// Инициализация страницы
+// ============================================================================
+document.addEventListener("DOMContentLoaded", () => {
+    loadStatus();    // Загрузить статистику в карточки
+    loadSessions();  // Загрузить историю запусков в таблицу
+    updateTime();    // Показывать текущее время в навбаре
+    setInterval(updateTime, 1000);
+});
+
+// Текущее время в навбаре
+function updateTime() {
+    document.getElementById("server-time").textContent = new Date().toLocaleString("ru-RU");
+}
+
+// ============================================================================
+// Загрузка статуса системы (GET /api/status)
+// ============================================================================
+async function loadStatus() {
+    try {
+        const r = await fetch("/api/status");
+        const d = await r.json();
+
+        document.getElementById("stat-works").textContent     = d.active_works.toLocaleString("ru");
+        document.getElementById("stat-materials").textContent  = d.materials.toLocaleString("ru");
+        document.getElementById("stat-batches").textContent    = d.available_batches.toLocaleString("ru");
+
+        // Последняя сессия: показываем статус и время
+        const el = document.getElementById("stat-last-session");
+        if (d.last_session) {
+            const s = d.last_session;
+            const badge = statusBadge(s.status);
+            const dt = s.completed_at
+                ? new Date(s.completed_at).toLocaleString("ru-RU")
+                : "в процессе...";
+            el.innerHTML = `${badge} <span class="text-muted fw-normal">${dt}</span>`;
+        } else {
+            el.textContent = "Нет данных";
+        }
+    } catch(e) {
+        console.error("Ошибка загрузки статуса:", e);
+    }
+}
+
+// ============================================================================
+// Загрузка таблицы сессий (GET /api/sessions)
+// ============================================================================
+let pollingTimer = null;  // Таймер опроса во время выполнения распределения
+
+async function loadSessions() {
+    try {
+        const r = await fetch("/api/sessions");
+        const sessions = await r.json();
+
+        const tbody = document.getElementById("sessions-tbody");
+
+        if (sessions.length === 0) {
+            tbody.innerHTML = `<tr><td colspan="5" class="text-center text-muted py-4">
+                Нет сессий. Запустите распределение.</td></tr>`;
+            return;
+        }
+
+        tbody.innerHTML = sessions.map(s => {
+            // Время запуска (только дата и время, без секунд)
+            const dt = s.started_at
+                ? new Date(s.started_at).toLocaleString("ru-RU", {
+                    day:"2-digit", month:"2-digit", year:"2-digit",
+                    hour:"2-digit", minute:"2-digit"
+                  })
+                : "—";
+
+            // Кнопка скачивания (только для завершённых сессий)
+            const downloadBtn = s.status === "completed"
+                ? `<a href="/api/export/${s.id}" class="btn btn-sm btn-outline-success py-0 px-2" title="Скачать Excel-отчёт">
+                       <i class="bi bi-file-earmark-excel"></i> Скачать
+                   </a>`
+                : `<span class="text-muted">—</span>`;
+
+            // Строка дефицита (красным если > 0)
+            const deficitCell = s.total_deficit > 0
+                ? `<span class="text-danger fw-semibold">${s.total_deficit.toLocaleString("ru")}</span>`
+                : `<span class="text-muted">${s.total_deficit}</span>`;
+
+            return `<tr>
+                <td class="text-muted">${dt}</td>
+                <td>${statusBadge(s.status)}</td>
+                <td class="text-end">${(s.total_requirements||0).toLocaleString("ru")}</td>
+                <td class="text-end">${deficitCell}</td>
+                <td class="text-center">${downloadBtn}</td>
+            </tr>`;
+        }).join("");
+
+        // Если есть сессия со статусом 'running' — опрашиваем каждые 3 сек
+        const hasRunning = sessions.some(s => s.status === "running");
+        if (hasRunning) {
+            if (!pollingTimer) {
+                pollingTimer = setInterval(() => {
+                    loadSessions();
+                    loadStatus();
+                }, 3000);
+            }
+        } else {
+            // Все завершились — останавливаем опрос
+            if (pollingTimer) {
+                clearInterval(pollingTimer);
+                pollingTimer = null;
+                // Показываем уведомление «готово»
+                document.getElementById("allocate-status").classList.add("d-none");
+                document.getElementById("allocate-done").classList.remove("d-none");
+                document.getElementById("btn-allocate").disabled = false;
+                setTimeout(() => {
+                    document.getElementById("allocate-done").classList.add("d-none");
+                }, 8000);
+            }
+        }
+
+    } catch(e) {
+        console.error("Ошибка загрузки сессий:", e);
+    }
+}
+
+// ============================================================================
+// Запуск распределения (POST /api/allocate)
+// ============================================================================
+async function runAllocation() {
+    const btn = document.getElementById("btn-allocate");
+    btn.disabled = true;
+
+    document.getElementById("allocate-done").classList.add("d-none");
+    document.getElementById("allocate-status").classList.remove("d-none");
+
+    try {
+        await fetch("/api/allocate", { method: "POST" });
+        // Сразу опрашиваем — сессия уже создана в БД
+        loadSessions();
+        loadStatus();
+    } catch(e) {
+        btn.disabled = false;
+        document.getElementById("allocate-status").classList.add("d-none");
+        alert("Ошибка при запуске: " + e.message);
+    }
+}
+
+// ============================================================================
+// Загрузка Excel-файла (POST /api/import/*)
+// ============================================================================
+async function uploadFile(input, endpoint, resultId) {
+    if (!input.files || !input.files[0]) return;
+
+    const file = input.files[0];
+    const el = document.getElementById(resultId);
+    el.innerHTML = `<span class="text-muted"><span class="spinner-border spinner-border-sm me-1"></span>Загрузка ${file.name}...</span>`;
+
+    const formData = new FormData();
+    formData.append("file", file);
+
+    try {
+        const r = await fetch(endpoint, { method: "POST", body: formData });
+        const d = await r.json();
+
+        if (r.ok) {
+            // Показываем статистику импорта (сколько строк загружено, ошибок)
+            const statsHtml = Object.entries(d.stats || {})
+                .map(([k, v]) => `<b>${v}</b> ${k}`)
+                .join(", ");
+            el.innerHTML = `<span class="text-success"><i class="bi bi-check-circle-fill me-1"></i>${statsHtml || "Импорт завершён"}</span>`;
+            // Обновляем счётчики в карточках
+            loadStatus();
+        } else {
+            el.innerHTML = `<span class="text-danger"><i class="bi bi-x-circle me-1"></i>${d.detail || "Ошибка"}</span>`;
+        }
+    } catch(e) {
+        el.innerHTML = `<span class="text-danger"><i class="bi bi-x-circle me-1"></i>Ошибка сети</span>`;
+    }
+
+    // Сбросить input чтобы можно было загрузить тот же файл повторно
+    input.value = "";
+}
+
+// ============================================================================
+// Вспомогательная функция: цветной бейдж статуса
+// ============================================================================
+function statusBadge(status) {
+    const map = {
+        "running":   ["warning",   "В процессе"],
+        "completed": ["success",   "Завершено"],
+        "failed":    ["danger",    "Ошибка"],
+    };
+    const [color, label] = map[status] || ["secondary", status];
+    return `<span class="badge bg-${color} text-${color === 'warning' ? 'dark' : 'white'}">${label}</span>`;
+}
+</script>
+</body>
+</html>
