@@ -22,6 +22,7 @@ from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 
 from app.ai.deficit_analyzer import explain_deficit, list_deficit_materials
+from app.ai.deficit_forecaster import forecast_deficit
 from app.core.config import settings
 from app.db.database import get_session
 
@@ -124,3 +125,39 @@ def explain_deficit_endpoint(body: ExplainRequest) -> ExplainResponse:
         )
 
     return ExplainResponse(**result)
+
+
+@router.get("/ai/forecast")
+def get_forecast(sessions: int = 5) -> dict:
+    """
+    AI-прогноз дефицита на основе истории сессий + текущего состояния склада.
+
+    Параметры:
+        sessions — сколько последних сессий взять для анализа (по умолчанию 5)
+
+    Анализирует:
+        - в каких сессиях какой материал был в дефиците (частота, объём)
+        - текущие остатки на складах
+        - потребности активных работ
+        - ожидаемые поставки
+
+    Возвращает прогноз Claude с уровнями риска: 🔴 ВЫСОКИЙ / 🟡 СРЕДНИЙ / 🟢 НИЗКИЙ
+    """
+    api_key = settings.anthropic_api_key
+    if not api_key:
+        raise HTTPException(
+            status_code=503,
+            detail="AI-анализ недоступен: ANTHROPIC_API_KEY не задан в .env",
+        )
+
+    try:
+        with get_session() as session:
+            result = forecast_deficit(
+                session=session,
+                last_n_sessions=max(1, min(sessions, 20)),  # от 1 до 20
+                api_key=api_key,
+            )
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Ошибка прогноза: {e}")
+
+    return result

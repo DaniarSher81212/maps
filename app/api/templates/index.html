@@ -287,7 +287,28 @@
         </h5>
         <p class="text-muted small mb-3">
             Выберите сессию и материал — Claude объяснит причину дефицита и даст рекомендацию.
+            Или запустите прогноз — Claude оценит риски по всем материалам сразу.
         </p>
+
+        <!-- Кнопка прогноза -->
+        <div class="mb-3">
+            <button class="btn btn-outline-primary" onclick="runForecast()" id="btn-forecast">
+                <i class="bi bi-graph-up-arrow me-1"></i>Прогноз дефицита
+                <span class="text-muted small ms-1">(последние 5 сессий)</span>
+            </button>
+        </div>
+
+        <!-- Результат прогноза -->
+        <div id="forecast-loading" class="d-none text-muted small py-2">
+            <div class="spinner-border spinner-border-sm text-primary me-2"></div>
+            Claude анализирует историю и остатки…
+        </div>
+        <div id="forecast-result" class="d-none">
+            <div class="bg-light rounded-3 p-3 ai-explanation mb-4" id="forecast-text"></div>
+        </div>
+        <div id="forecast-error" class="alert alert-danger d-none mb-3"></div>
+
+        <hr class="my-3">
 
         <div class="row g-3 align-items-end">
             <div class="col-md-4">
@@ -523,6 +544,37 @@ async function uploadFile(input, endpoint, resultId) {
 // ============================================================================
 // AI-анализ дефицита
 // ============================================================================
+
+// ============================================================================
+// Прогноз дефицита
+// ============================================================================
+
+async function runForecast() {
+    const btn = document.getElementById("btn-forecast");
+    btn.disabled = true;
+
+    document.getElementById("forecast-result").classList.add("d-none");
+    document.getElementById("forecast-error").classList.add("d-none");
+    document.getElementById("forecast-loading").classList.remove("d-none");
+
+    try {
+        const r = await fetch("/api/ai/forecast?sessions=5");
+        const d = await r.json();
+
+        if (!r.ok) throw new Error(d.detail || "Ошибка прогноза");
+
+        document.getElementById("forecast-text").textContent = d.forecast;
+        document.getElementById("forecast-result").classList.remove("d-none");
+
+    } catch(e) {
+        const errEl = document.getElementById("forecast-error");
+        errEl.textContent = "Ошибка: " + e.message;
+        errEl.classList.remove("d-none");
+    } finally {
+        document.getElementById("forecast-loading").classList.add("d-none");
+        btn.disabled = false;
+    }
+}
 
 // Заполняем дропдаун сессий (только завершённые с дефицитом)
 function populateAiSessions(sessions) {
