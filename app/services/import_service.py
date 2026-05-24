@@ -48,8 +48,10 @@ from pydantic import ValidationError
 from app.core.logging_config import get_logger
 from app.db.database import get_session
 from app.db.models import (
+    AllocationResult,
     IssuedNotWrittenOff,
     StockBatch,
+    StockMovement,
     Supply,
     SupplyLine,
     Warehouse,
@@ -517,10 +519,13 @@ def import_stock(file_path: Path, sheet_name: int | str = 0) -> dict[str, int]:
     with get_session() as session:
         material_repo = MaterialRepository(session)
 
-        # Очищаем старые данные перед загрузкой нового снимка
+        # Очищаем старые данные перед загрузкой нового снимка.
+        # StockMovement ссылается на StockBatch через FK — удаляем сначала движения,
+        # иначе PostgreSQL не разрешит удалить партии (FK violation).
         from sqlalchemy import delete
+        session.execute(delete(StockMovement))
         session.execute(delete(StockBatch))
-        logger.info("Очищены старые складские остатки (партии)")
+        logger.info("Очищены старые складские остатки (партии и движения)")
 
         # Кэш складов — чтобы не делать запрос к БД для каждой партии
         warehouse_cache: dict[str, Warehouse] = {}
@@ -617,8 +622,13 @@ def import_supplies(file_path: Path, sheet_name: int | str = 0) -> dict[str, int
     with get_session() as session:
         material_repo = MaterialRepository(session)
 
-        # Очищаем старые данные: сначала строки (из-за FK), потом заголовки
-        from sqlalchemy import delete
+        # Очищаем старые данные: сначала строки (из-за FK), потом заголовки.
+        # AllocationResult.supply_line_id ссылается на SupplyLine — обнуляем ссылку
+        # (не удаляем результаты, чтобы сохранить историю сессий).
+        from sqlalchemy import delete, update
+        session.execute(
+            update(AllocationResult).values(supply_line_id=None)
+        )
         session.execute(delete(SupplyLine))
         session.execute(delete(Supply))
         logger.info("Очищены старые поставки")
