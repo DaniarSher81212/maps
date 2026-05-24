@@ -293,21 +293,19 @@ def import_requirements(file_path: Path, sheet_name: int | str = 0) -> dict[str,
         material_repo = MaterialRepository(session)
         req_repo = RequirementRepository(session)
 
-        # Полная замена: удаляем все плановые (не аварийные) потребности перед импортом.
-        # Сначала обнуляем ссылки в истории распределений — чтобы не нарушить FK.
-        # AllocationResult.requirement_id и DeficitRecord.requirement_id — nullable,
-        # поэтому историю сессий сохраняем, просто теряем связь с конкретной потребностью.
-        from sqlalchemy import delete, select, update
-        non_emergency_req_ids = select(Requirement.id).join(Work).where(Work.is_emergency == False)
-        session.execute(update(AllocationResult).where(
-            AllocationResult.requirement_id.in_(non_emergency_req_ids)
-        ).values(requirement_id=None))
-        session.execute(update(DeficitRecord).where(
-            DeficitRecord.requirement_id.in_(non_emergency_req_ids)
-        ).values(requirement_id=None))
+        # Полная замена: удаляем все плановые (не аварийные) работы и связанные данные.
+        # Порядок — от дочерних таблиц к родительским, чтобы не нарушить FK-ограничения.
+        from sqlalchemy import delete, select
+
         non_emergency_work_ids = select(Work.id).where(Work.is_emergency == False)
+        session.execute(delete(StockMovement).where(StockMovement.work_id.in_(non_emergency_work_ids)))
+        session.execute(delete(AllocationResult).where(AllocationResult.work_id.in_(non_emergency_work_ids)))
+        session.execute(delete(DeficitRecord).where(DeficitRecord.work_id.in_(non_emergency_work_ids)))
+        session.execute(delete(WriteOff).where(WriteOff.work_id.in_(non_emergency_work_ids)))
+        session.execute(delete(IssuedNotWrittenOff).where(IssuedNotWrittenOff.work_id.in_(non_emergency_work_ids)))
         session.execute(delete(Requirement).where(Requirement.work_id.in_(non_emergency_work_ids)))
-        logger.info("Очищены плановые потребности перед новым импортом")
+        session.execute(delete(Work).where(Work.is_emergency == False))
+        logger.info("Удалены все плановые работы и связанные данные перед новым импортом")
 
         # Предзагружаем существующие работы и материалы в словари для O(1) поиска.
         # Это важная оптимизация: без неё импорт 10 000 строк = 10 000 SELECT-запросов.
@@ -434,18 +432,19 @@ def import_emergency_works(file_path: Path, sheet_name: int | str = 0) -> dict[s
         material_repo = MaterialRepository(session)
         req_repo = RequirementRepository(session)
 
-        # Полная замена: удаляем все аварийные потребности перед импортом.
-        from sqlalchemy import delete, select, update
-        emergency_req_ids = select(Requirement.id).join(Work).where(Work.is_emergency == True)
-        session.execute(update(AllocationResult).where(
-            AllocationResult.requirement_id.in_(emergency_req_ids)
-        ).values(requirement_id=None))
-        session.execute(update(DeficitRecord).where(
-            DeficitRecord.requirement_id.in_(emergency_req_ids)
-        ).values(requirement_id=None))
+        # Полная замена: удаляем все аварийные работы и связанные данные.
+        # Порядок — от дочерних таблиц к родительским, чтобы не нарушить FK-ограничения.
+        from sqlalchemy import delete, select
+
         emergency_work_ids = select(Work.id).where(Work.is_emergency == True)
+        session.execute(delete(StockMovement).where(StockMovement.work_id.in_(emergency_work_ids)))
+        session.execute(delete(AllocationResult).where(AllocationResult.work_id.in_(emergency_work_ids)))
+        session.execute(delete(DeficitRecord).where(DeficitRecord.work_id.in_(emergency_work_ids)))
+        session.execute(delete(WriteOff).where(WriteOff.work_id.in_(emergency_work_ids)))
+        session.execute(delete(IssuedNotWrittenOff).where(IssuedNotWrittenOff.work_id.in_(emergency_work_ids)))
         session.execute(delete(Requirement).where(Requirement.work_id.in_(emergency_work_ids)))
-        logger.info("Очищены аварийные потребности перед новым импортом")
+        session.execute(delete(Work).where(Work.is_emergency == True))
+        logger.info("Удалены все аварийные работы и связанные данные перед новым импортом")
 
         existing_works = work_repo.get_kod_map()
         existing_materials = material_repo.get_id_map()
@@ -654,16 +653,17 @@ def import_supplies(file_path: Path, sheet_name: int | str = 0) -> dict[str, int
     with get_session() as session:
         material_repo = MaterialRepository(session)
 
-        # Очищаем старые данные: сначала строки (из-за FK), потом заголовки.
-        # AllocationResult.supply_line_id ссылается на SupplyLine — обнуляем ссылку
-        # (не удаляем результаты, чтобы сохранить историю сессий).
-        from sqlalchemy import delete, update
-        session.execute(
-            update(AllocationResult).values(supply_line_id=None)
-        )
+        # Полная замена: удаляем строки распределений ссылающихся на поставки,
+        # затем сами поставки. Порядок важен из-за FK-ограничений.
+        from sqlalchemy import delete, select
+
+        all_supply_line_ids = select(SupplyLine.id)
+        session.execute(delete(AllocationResult).where(
+            AllocationResult.supply_line_id.in_(all_supply_line_ids)
+        ))
         session.execute(delete(SupplyLine))
         session.execute(delete(Supply))
-        logger.info("Очищены старые поставки")
+        logger.info("Удалены старые поставки и связанные строки распределений")
 
         # Кэши для предотвращения дублей в текущей сессии
         supply_cache: dict[str, Supply] = {}     # {ключ_договора: Supply}
