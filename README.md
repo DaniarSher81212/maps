@@ -25,6 +25,7 @@
 14. [Переменные окружения](#14-переменные-окружения)
 15. [Роадмап](#15-роадмап)
 16. [Частые вопросы](#16-частые-вопросы)
+17. [Диагностика и решение проблем](#17-диагностика-и-решение-проблем)
 
 ---
 
@@ -208,7 +209,7 @@ PythonProject/
 
 ```bash
 # Клонировать репозиторий
-git clone <url> && cd PythonProject
+git clone https://github.com/DaniarSher81212/maps.git && cd maps
 
 # Создать виртуальное окружение
 python3.11 -m venv .venv
@@ -622,76 +623,235 @@ pytest tests/test_engine.py::test_layer1_full_writeoff -v
 
 ## 13. Деплой на сервер
 
-### Требования
-- Oracle Cloud VM (Ubuntu 22.04) или любой VPS
-- 1 ГБ RAM минимум (рекомендуется 2 ГБ)
-- SSH-доступ
+### Текущий production-сервер
 
-### Быстрый деплой одной командой
+| Параметр | Значение |
+|---|---|
+| Провайдер | Oracle Cloud (Always Free tier) |
+| IP-адрес | `132.145.232.46` |
+| ОС | Ubuntu 22.04 LTS |
+| Пользователь | `ubuntu` |
+| Путь проекта | `~/maps` |
+| Автозапуск | systemd-сервис `maps.service` |
+| Публичный доступ | Cloudflare Quick Tunnel |
+
+---
+
+### Шаг 1 — Подключиться к серверу
+
+Oracle Cloud требует SSH-ключ (пароли отключены). Два способа:
+
+#### Вариант A — Oracle Cloud Shell (рекомендуется, не нужен ключ)
+
+Откройте [cloud.oracle.com](https://cloud.oracle.com) → нажмите иконку **`>_`** (Cloud Shell) в правом верхнем углу браузера. Откроется встроенный терминал с уже настроенным доступом к вашим инстансам.
 
 ```bash
-# 1. Скопировать код на сервер
-scp -r . ubuntu@<IP>:~/maps
+# В Oracle Cloud Shell:
+ssh ubuntu@132.145.232.46
+```
 
-# 2. Подключиться и запустить установку
-ssh ubuntu@<IP>
-cd ~/maps
+#### Вариант B — С локальной машины (нужен SSH-ключ)
+
+```bash
+# Создать ключ (один раз)
+ssh-keygen -t ed25519 -f ~/.ssh/maps_key -N ""
+
+# Показать публичный ключ — скопируйте его
+cat ~/.ssh/maps_key.pub
+```
+
+Добавьте публичный ключ в Oracle Cloud Console:
+**Compute → Instances → ваш инстанс → Add SSH Keys → вставьте ключ**
+
+```bash
+# Подключиться
+ssh -i ~/.ssh/maps_key ubuntu@132.145.232.46
+```
+
+---
+
+### Шаг 2 — Клонировать проект на сервер
+
+```bash
+# На сервере (после SSH):
+git clone https://github.com/DaniarSher81212/maps.git
+cd maps
+```
+
+---
+
+### Шаг 3 — Запустить установку
+
+```bash
 sudo bash deploy/setup.sh
 ```
 
-`setup.sh` автоматически:
-- устанавливает Python 3.11, PostgreSQL, cloudflared
-- создаёт базу данных `maps_db` и пользователя `maps_user`
-- создаёт виртуальное окружение и устанавливает зависимости
-- создаёт `.env` с настройками production
-- применяет Alembic-миграции
-- регистрирует MAPS как systemd-сервис (автозапуск)
+**Что делает скрипт (~5 минут):**
+
+| Действие | Результат |
+|---|---|
+| `apt-get install python3.11 postgresql cloudflared` | Системные зависимости |
+| `CREATE USER maps_user` + `CREATE DATABASE maps_db` | PostgreSQL готов |
+| `python3.11 -m venv .venv && pip install -e .` | Виртуальное окружение |
+| Создаёт `.env` с параметрами production | Конфигурация приложения |
+| `alembic upgrade head` | Таблицы созданы в БД |
+| `systemctl enable maps` | Сервис зарегистрирован, автозапуск включён |
+
+По окончании выводится итоговое сообщение с командами управления.
+
+---
+
+### Шаг 4 — Добавить ANTHROPIC_API_KEY
+
+`setup.sh` создаёт `.env` без ключа Claude API (ключ нельзя хранить в скрипте). Добавьте вручную:
 
 ```bash
-# 3. Запустить
-sudo systemctl start maps
-sudo systemctl status maps   # Active: active (running)
+echo "ANTHROPIC_API_KEY=sk-ant-api03-ВАШ_КЛЮЧ" >> .env
+```
 
-# 4. Открыть публичный туннель
-bash deploy/tunnel.sh
+Ключ можно получить или скопировать на [console.anthropic.com](https://console.anthropic.com).
+
+> **Без ключа система работает** — импорт, распределение, экспорт. Только три AI-эндпоинта вернут `503`.
+
+---
+
+### Шаг 5 — Запустить MAPS и проверить
+
+```bash
+sudo systemctl start maps
+
+# Проверить статус — должно быть "Active: active (running)"
+sudo systemctl status maps
+
+# Проверить что API отвечает
+curl http://localhost:8000/api/status
+```
+
+---
+
+### Шаг 6 — Открыть Cloudflare Quick Tunnel
+
+```bash
+# Фоновый режим: туннель работает даже при закрытом терминале*
+bash deploy/tunnel.sh --bg
+
+# Получить публичный URL
+cat /tmp/maps_tunnel.url
 # → https://xxxx.trycloudflare.com
 ```
+
+Откройте ссылку в браузере — должен загрузиться дашборд MAPS.
+
+> *При закрытии Cloud Shell сессии туннель всё равно остановится. Чтобы туннель работал постоянно — добавьте его в systemd (см. ниже).
+
+---
 
 ### Управление сервисом
 
 ```bash
-sudo systemctl start maps      # Запустить
-sudo systemctl stop maps       # Остановить
-sudo systemctl restart maps    # Перезапустить (после обновления)
-sudo systemctl status maps     # Статус
-
-sudo journalctl -u maps -f               # Логи в реальном времени
-sudo journalctl -u maps -n 50            # Последние 50 строк
-sudo journalctl -u maps --since "1h ago" # Логи за последний час
+sudo systemctl start maps        # Запустить
+sudo systemctl stop maps         # Остановить
+sudo systemctl restart maps      # Перезапустить (после обновления кода)
+sudo systemctl status maps       # Статус + последние строки лога
+sudo systemctl enable maps       # Включить автозапуск (уже включён после setup.sh)
+sudo systemctl disable maps      # Отключить автозапуск
 ```
 
-### Обновление
+#### Просмотр логов
+
+```bash
+# Логи в реальном времени (Ctrl+C для выхода)
+sudo journalctl -u maps -f
+
+# Последние 50 строк
+sudo journalctl -u maps -n 50 --no-pager
+
+# Логи за последний час
+sudo journalctl -u maps --since "1 hour ago" --no-pager
+
+# Логи с момента последнего старта
+sudo journalctl -u maps -b --no-pager
+```
+
+---
+
+### Обновление кода (после git push)
 
 ```bash
 cd ~/maps
 git pull origin main
 sudo systemctl restart maps
+sudo systemctl status maps   # Убедиться что запустился
 ```
+
+---
 
 ### Cloudflare Quick Tunnel
 
-Создаёт временную публичную ссылку без домена и без регистрации:
+Cloudflare Tunnel создаёт публичный HTTPS-адрес без необходимости открывать порты в Oracle Cloud или иметь домен. Всё работает через исходящие соединения (outbound), поэтому файрвол настраивать не нужно.
 
 ```bash
-# Обычный запуск (URL отображается в терминале)
+# Запуск в foreground (туннель работает пока открыт терминал):
 bash deploy/tunnel.sh
 
-# Фоновый режим (URL сохраняется в /tmp/maps_tunnel.url)
+# Запуск в фоне (URL сохраняется в файл):
 bash deploy/tunnel.sh --bg
 cat /tmp/maps_tunnel.url
+
+# Остановить фоновый туннель:
+kill $(cat /tmp/cloudflared.pid)
 ```
 
-URL вида `https://xxxx.trycloudflare.com` меняется при каждом перезапуске туннеля.
+**Особенности Quick Tunnel:**
+- URL меняется при каждом перезапуске (это бесплатная версия)
+- Если нужен постоянный URL — нужна регистрация в Cloudflare и настройка Named Tunnel
+- Туннель работает только пока запущен процесс cloudflared
+
+---
+
+### Постоянный туннель через systemd (опционально)
+
+Чтобы туннель запускался автоматически вместе с сервером:
+
+```bash
+# Создать systemd-сервис для туннеля
+sudo tee /etc/systemd/system/maps-tunnel.service > /dev/null <<EOF
+[Unit]
+Description=MAPS Cloudflare Tunnel
+After=maps.service
+Requires=maps.service
+
+[Service]
+Type=simple
+User=ubuntu
+ExecStart=/usr/local/bin/cloudflared tunnel --url http://localhost:8000 --no-autoupdate
+Restart=on-failure
+RestartSec=10s
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+sudo systemctl daemon-reload
+sudo systemctl enable maps-tunnel
+sudo systemctl start maps-tunnel
+
+# Посмотреть URL в логах
+sudo journalctl -u maps-tunnel -n 20 | grep trycloudflare
+```
+
+---
+
+### Известные особенности Oracle Cloud
+
+| Проблема | Причина | Решение |
+|---|---|---|
+| `Permission denied (publickey)` при SSH | Oracle Cloud отключает вход по паролю | Используйте Oracle Cloud Shell или добавьте SSH-ключ |
+| `ModuleNotFoundError: No module named 'anthropic'` при запуске | Пакет не попал в установку | `.venv/bin/pip install anthropic` |
+| Сервис запущен, но `curl /` возвращает 404 | Воркеры uvicorn падают при старте | Убрать `--workers 2` из maps.service (уже сделано) |
+| Порт 8000 занят после `systemctl stop` | Воркеры не завершились | `sudo fuser -k 8000/tcp` |
 
 ---
 
@@ -799,3 +959,168 @@ HTTP-запрос должен вернуть ответ быстро (до та
 **Q: Сколько сессий хранить для RAG-чата?**
 
 По умолчанию берутся последние 50 сессий. Этого достаточно для нескольких месяцев работы. При тысячах сессий потребуется переход на векторный поиск (планируется в Этапе 5).
+
+---
+
+## 17. Диагностика и решение проблем
+
+### MAPS не запускается
+
+```bash
+# Смотрим детальный лог ошибки:
+sudo journalctl -u maps -n 100 --no-pager
+
+# Тест: сам Python может импортировать приложение?
+cd ~/maps && .venv/bin/python -c "from app.api.main import app; print('OK')"
+
+# Тест: uvicorn запускается вручную?
+sudo systemctl stop maps
+sudo fuser -k 8000/tcp          # освободить порт
+.venv/bin/uvicorn app.api.main:app --host 0.0.0.0 --port 8000
+```
+
+### Ошибка: ModuleNotFoundError
+
+```
+ModuleNotFoundError: No module named 'anthropic'
+ModuleNotFoundError: No module named 'fastapi'
+```
+
+**Причина:** `pip install -e .` установил не все пакеты (они были в requirements.txt, но не в pyproject.toml).
+
+```bash
+# Установить недостающие пакеты:
+.venv/bin/pip install anthropic fastapi uvicorn[standard] jinja2 python-multipart
+sudo systemctl restart maps
+```
+
+### Ошибка: address already in use
+
+```
+ERROR: [Errno 98] error while attempting to bind on address ('0.0.0.0', 8000): address already in use
+```
+
+**Причина:** Предыдущий процесс uvicorn не завершился.
+
+```bash
+# Найти и убить процесс на порту 8000:
+sudo fuser -k 8000/tcp
+
+# Или найти PID вручную:
+sudo ss -tlnp | grep 8000
+kill <PID>
+```
+
+### Сервис запущен, но дашборд отдаёт 404
+
+**Причина:** Воркеры uvicorn падают при старте, master-процесс жив но маршруты не работают.
+
+```bash
+# Проверить количество задач (с --workers 2 должно быть 3+, иначе воркеры упали):
+sudo systemctl status maps | grep Tasks
+
+# Проверить что установлен режим без --workers:
+grep ExecStart /etc/systemd/system/maps.service
+
+# Если там всё ещё --workers 2 — убрать:
+sudo sed -i '/--workers/d' /etc/systemd/system/maps.service
+sudo systemctl daemon-reload
+sudo systemctl restart maps
+```
+
+### Cloudflare Tunnel не запускается
+
+```bash
+# Проверить что MAPS отвечает:
+curl http://localhost:8000/api/status
+
+# Запустить туннель вручную и смотреть вывод:
+cloudflared tunnel --url http://localhost:8000 --no-autoupdate
+
+# Если cloudflared не установлен:
+ARCH=$(dpkg --print-architecture)
+curl -L "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-${ARCH}.deb" -o /tmp/cf.deb
+sudo dpkg -i /tmp/cf.deb
+```
+
+### Ошибка подключения к PostgreSQL
+
+```
+sqlalchemy.exc.OperationalError: could not connect to server
+```
+
+```bash
+# Проверить что PostgreSQL запущен:
+sudo systemctl status postgresql
+
+# Проверить подключение вручную:
+psql -U maps_user -d maps_db -h localhost -c "SELECT 1;"
+
+# Проверить что пароль в .env совпадает с паролем в PostgreSQL:
+cat .env | grep DB_PASSWORD
+
+# Сменить пароль если нужно:
+sudo -u postgres psql -c "ALTER USER maps_user PASSWORD 'новый_пароль';"
+# И обновить в .env
+nano .env
+sudo systemctl restart maps
+```
+
+### Ошибки при импорте Excel
+
+```
+KeyError: 'kod_raboty'          # колонка не найдена
+ValueError: could not convert   # неверный тип данных
+```
+
+**Диагностика:**
+```bash
+# Посмотреть что пришло в API:
+sudo journalctl -u maps -n 30 --no-pager | grep -E "(ERROR|error|import)"
+```
+
+**Типичные причины:**
+- Другое название колонки (пробелы, другой регистр) — import_service нормализует, но только известные варианты
+- Пустые строки в Excel — игнорируются автоматически
+- Числа в колонке-строке — Pydantic сконвертирует, если возможно
+
+### Тесты падают
+
+```bash
+# Убедиться что тестовая БД доступна:
+psql -U maps_user -d maps_db -c "SELECT 1;"
+
+# Запустить один тест с подробным выводом:
+pytest tests/test_engine.py::test_layer1_full_writeoff -v -s
+
+# Посмотреть фикстуры (conftest.py) — там создаётся тестовое окружение:
+cat tests/conftest.py
+```
+
+### Общий чеклист диагностики
+
+```bash
+# 1. Статус сервиса
+sudo systemctl status maps
+
+# 2. Последние логи
+sudo journalctl -u maps -n 30 --no-pager
+
+# 3. Приложение отвечает?
+curl http://localhost:8000/api/status
+
+# 4. PostgreSQL работает?
+sudo systemctl status postgresql
+
+# 5. Свободное место на диске (pandas + Excel могут занять много)
+df -h
+
+# 6. Свободная память
+free -h
+
+# 7. Версия Python в venv
+.venv/bin/python --version
+
+# 8. Установленные пакеты
+.venv/bin/pip list | grep -E "(anthropic|fastapi|uvicorn|sqlalchemy)"
+```
