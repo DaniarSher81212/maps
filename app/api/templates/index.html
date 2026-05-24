@@ -292,7 +292,7 @@
 </div><!-- /container -->
 
 <div class="mt-5 py-3 text-center text-muted small border-top">
-    MAPS v2.0 &nbsp;·&nbsp; <a href="/docs" class="text-muted">API документация</a>
+    MAPS v3.0.0 &nbsp;·&nbsp; <a href="/docs" class="text-muted">API документация</a>
 </div>
 
 <!-- Bootstrap JS -->
@@ -381,7 +381,7 @@ function updateCurrentSessionCard(s) {
             pollingTimer = setInterval(loadStatus, 3000);
         }
     } else {
-        // Завершилась — останавливаем опрос
+        // Завершилась — останавливаем опрос (если он был запущен)
         if (pollingTimer) {
             clearInterval(pollingTimer);
             pollingTimer = null;
@@ -391,10 +391,15 @@ function updateCurrentSessionCard(s) {
             setTimeout(() => {
                 document.getElementById("allocate-done").classList.add("d-none");
             }, 8000);
-            // Загружаем материалы с дефицитом для AI-анализа
-            if (s.total_deficit > 0) {
-                loadDeficitMaterials(s.id);
-            }
+        }
+
+        // Загружаем материалы с дефицитом для AI-анализа:
+        // — при первом открытии страницы с готовой сессией
+        // — после завершения нового распределения
+        // Проверяем по session_id чтобы не перезагружать список без причины
+        const matSel = document.getElementById("ai-material");
+        if (s.total_deficit > 0 && matSel.dataset.sessionId !== s.id) {
+            loadDeficitMaterials(s.id);
         }
     }
 }
