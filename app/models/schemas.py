@@ -69,8 +69,7 @@ class WorkImportRow(MapsBaseModel):
     podrazdelenie: Optional[str] = None
     centr_zatrat: Optional[str] = None
     zavod: Optional[str] = None
-    data_nachala: Optional[date] = None
-    data_okonchaniya: Optional[date] = None
+    # Дат нет — они берутся из «Перечня работ» и хранятся в таблице works
     prioritet: int = Field(default=3, ge=1, le=3, description="Приоритет: 1 (высший) - 3 (низший)")
     status: str = Field(default="active")
     naimenovanie_materiala: Optional[str] = None
@@ -117,19 +116,6 @@ class WorkImportRow(MapsBaseModel):
         except Exception:
             raise ValueError(f"Некорректное количество: {v!r}")
 
-    @model_validator(mode="after")
-    def check_dates(self) -> "WorkImportRow":
-        """Проверяем, что дата начала не позже даты окончания."""
-        if (
-            self.data_nachala is not None
-            and self.data_okonchaniya is not None
-            and self.data_nachala > self.data_okonchaniya
-        ):
-            raise ValueError(
-                f"Дата начала ({self.data_nachala}) не может быть позже "
-                f"даты окончания ({self.data_okonchaniya})"
-            )
-        return self
 
 
 class WorkListImportRow(MapsBaseModel):

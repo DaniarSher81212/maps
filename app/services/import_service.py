@@ -84,6 +84,8 @@ logger = get_logger(__name__)
 #     Если клиент даст файл с другими заголовками — меняем только этот словарь.
 
 # Колонки для файла потребностей (и аварийных работ — тот же формат)
+# Даты начала/окончания в этом файле НЕТ — они приходят только из «Перечня работ»
+# и хранятся в таблице works. При импорте потребностей код берёт даты оттуда.
 REQUIREMENTS_COLUMN_MAP = {
     "Код работы":           "kod_raboty",
     "Тип работы":           "tip_raboty",
@@ -91,15 +93,12 @@ REQUIREMENTS_COLUMN_MAP = {
     "Подразделение":        "podrazdelenie",
     "Центр затрат":         "centr_zatrat",
     "Завод":                "zavod",
-    "Дата начала":          "data_nachala",
-    "Дата окончания":       "data_okonchaniya",
     "Приоритет":            "prioritet",
     "Статус":               "status",
     "Системный номер":      "sys_nomer_materiala",
     "Наименование материала": "naimenovanie_materiala",
     "Ед.изм":               "ed_izm",
     "Потребность":          "potrebnost",
-    # НОВОЕ: прогнозная цена из заявки — для расчёта обеспечённости по стоимости
     "Прогнозная цена":      "prognosnaya_tsena",
 }
 
@@ -366,6 +365,7 @@ def import_requirements(file_path: Path, sheet_name: int | str = 0) -> dict[str,
             # Проверяем: нет в БД И нет среди новых в этой сессии
             if (validated.kod_raboty not in existing_works
                     and validated.kod_raboty not in new_works_in_session):
+                # Даты не передаём — они устанавливаются только через «Перечень работ»
                 work_repo.get_or_create(
                     kod_raboty=validated.kod_raboty,
                     tip_raboty=validated.tip_raboty,
@@ -373,11 +373,9 @@ def import_requirements(file_path: Path, sheet_name: int | str = 0) -> dict[str,
                     podrazdelenie=validated.podrazdelenie,
                     centr_zatrat=validated.centr_zatrat,
                     zavod=validated.zavod,
-                    data_nachala=validated.data_nachala,
-                    data_okonchaniya=validated.data_okonchaniya,
                     prioritet=validated.prioritet,
                     status=validated.status,
-                    is_emergency=False,  # Обычный файл — не аварийные работы
+                    is_emergency=False,
                 )
                 new_works_in_session.add(validated.kod_raboty)
                 stats["works"] += 1
@@ -493,6 +491,7 @@ def import_emergency_works(file_path: Path, sheet_name: int | str = 0) -> dict[s
             # Создаём работу с флагом is_emergency=True (это ключевое отличие!)
             if (validated.kod_raboty not in existing_works
                     and validated.kod_raboty not in new_works_in_session):
+                # Даты не передаём — они устанавливаются только через «Перечень работ»
                 work_repo.get_or_create(
                     kod_raboty=validated.kod_raboty,
                     tip_raboty=validated.tip_raboty,
@@ -500,11 +499,9 @@ def import_emergency_works(file_path: Path, sheet_name: int | str = 0) -> dict[s
                     podrazdelenie=validated.podrazdelenie,
                     centr_zatrat=validated.centr_zatrat,
                     zavod=validated.zavod,
-                    data_nachala=validated.data_nachala,
-                    data_okonchaniya=validated.data_okonchaniya,
                     prioritet=validated.prioritet,
                     status=validated.status,
-                    is_emergency=True,  # ← ВОТ ЕДИНСТВЕННОЕ ОТЛИЧИЕ ОТ ОБЫЧНОГО ИМПОРТА
+                    is_emergency=True,
                 )
                 new_works_in_session.add(validated.kod_raboty)
                 stats["works"] += 1
