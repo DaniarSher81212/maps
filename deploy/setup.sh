@@ -100,7 +100,7 @@ sudo -u "$APP_USER" "$VENV_DIR/bin/pip" install --upgrade pip -q
 sudo -u "$APP_USER" "$VENV_DIR/bin/pip" install -e "$PROJECT_DIR" -q
 # FastAPI и uvicorn указаны в requirements.txt, но на всякий случай:
 sudo -u "$APP_USER" "$VENV_DIR/bin/pip" install \
-    fastapi uvicorn[standard] jinja2 python-multipart -q
+    fastapi uvicorn[standard] jinja2 python-multipart anthropic -q
 
 log "Python-зависимости установлены"
 

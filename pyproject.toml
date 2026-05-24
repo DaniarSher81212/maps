@@ -46,6 +46,15 @@ dependencies = [
 
     # --- Окружение ---
     "python-dotenv>=1.0.0",  # Загрузка переменных из .env файла
+
+    # --- API и веб ---
+    "fastapi>=0.110.0",          # Веб-фреймворк для REST API
+    "uvicorn[standard]>=0.29.0", # ASGI-сервер для запуска FastAPI
+    "jinja2>=3.1.0",             # Шаблонизатор HTML для дашборда
+    "python-multipart>=0.0.9",   # Поддержка загрузки файлов (multipart/form-data)
+
+    # --- AI ---
+    "anthropic>=0.40.0",  # Claude API для AI-анализа дефицита
 ]
 
 [project.optional-dependencies]
