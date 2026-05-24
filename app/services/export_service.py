@@ -92,14 +92,18 @@ def export_allocation_results(
         df_balances     = _get_warehouse_balances_df(session, session_id)
         df_possible     = _get_possible_movements_df(session, session_id)
         df_coverage     = _get_coverage_by_work_df(session, session_id)
+        df_transit      = _get_in_transit_allocated_df(session, session_id)
+        df_transit_free = _get_in_transit_unallocated_df(session, session_id)
 
-    # Записываем в Excel (5 листов)
+    # Записываем в Excel (7 листов)
     with pd.ExcelWriter(file_path, engine="openpyxl") as writer:
-        _write_sheet(writer, df_main,     "Распределение")
-        _write_sheet(writer, df_movement, "Движение склада")
-        _write_sheet(writer, df_balances, "Остатки складов")
-        _write_sheet(writer, df_possible, "Возможное перемещение")
-        _write_sheet(writer, df_coverage, "Обеспеченность")
+        _write_sheet(writer, df_main,         "Распределение")
+        _write_sheet(writer, df_movement,     "Движение склада")
+        _write_sheet(writer, df_balances,     "Остатки складов")
+        _write_sheet(writer, df_possible,     "Возможное перемещение")
+        _write_sheet(writer, df_coverage,     "Обеспеченность")
+        _write_sheet(writer, df_transit,      "В пути")
+        _write_sheet(writer, df_transit_free, "Не распред. в пути")
 
     logger.info(
         "Отчёт создан: %s | строк в главной таблице: %d",
@@ -660,6 +664,101 @@ def _get_coverage_by_work_df(session, session_id: str) -> pd.DataFrame:
     })
 
     return result
+
+
+# =============================================================================
+# Лист 6: В пути — распределённые поставки
+# =============================================================================
+
+def _get_in_transit_allocated_df(session, session_id: str) -> pd.DataFrame:
+    """
+    Строки поставок («в пути»), которые были распределены на потребности
+    в данной сессии (allocation_results WHERE istochnik='postavka').
+
+    Показывает: кому, что, сколько и по какому договору распределено из поставок.
+    """
+    sql = text("""
+        SELECT
+            s.dogovor                           AS "Договор",
+            s.postavshchik                      AS "Поставщик",
+            s.data_postavki                     AS "Дата поставки",
+            s.filial                            AS "Филиал поставки",
+            s.zavod                             AS "Завод поставки",
+            w.kod_raboty                        AS "Код работы",
+            COALESCE(w.nazvanie, '')            AS "Наименование работы",
+            m.sys_nomer                         AS "Системный номер",
+            m.naimenovanie                      AS "Наименование материала",
+            m.ed_izm                            AS "Ед.изм",
+            ar.kolichestvo                      AS "Кол-во распределено",
+            ar.srednyaya_stoimost               AS "Стоимость за ед",
+            ar.summa                            AS "Сумма"
+        FROM allocation_results ar
+        JOIN supply_lines sl  ON sl.id  = ar.supply_line_id
+        JOIN supplies s       ON s.id   = sl.supply_id
+        JOIN requirements r   ON r.id   = ar.requirement_id
+        JOIN works w          ON w.id   = r.work_id
+        JOIN materials m      ON m.id   = ar.material_id
+        WHERE ar.session_id   = :sid
+          AND ar.istochnik    = 'postavka'
+        ORDER BY s.data_postavki ASC NULLS LAST,
+                 s.dogovor,
+                 w.kod_raboty,
+                 m.sys_nomer
+    """)
+    rows = session.execute(sql, {"sid": session_id}).fetchall()
+    if not rows:
+        return pd.DataFrame(columns=[
+            "Договор", "Поставщик", "Дата поставки", "Филиал поставки", "Завод поставки",
+            "Код работы", "Наименование работы", "Системный номер", "Наименование материала",
+            "Ед.изм", "Кол-во распределено", "Стоимость за ед", "Сумма",
+        ])
+    return pd.DataFrame(rows, columns=list(rows[0]._fields))
+
+
+# =============================================================================
+# Лист 7: Не распределено в пути
+# =============================================================================
+
+def _get_in_transit_unallocated_df(session, _session_id: str = "") -> pd.DataFrame:
+    """
+    Строки поставок, у которых после распределения остался остаток dostupno > 0.
+
+    Это материалы «в пути», которые никуда (или не полностью) не ушли.
+    Помогает понять: что ещё можно использовать, и нет ли лишних закупок.
+
+    Поле «Распределено» = kolichestvo - dostupno (сколько уже взяли из этой строки).
+    """
+    sql = text("""
+        SELECT
+            s.dogovor                           AS "Договор",
+            s.postavshchik                      AS "Поставщик",
+            s.data_postavki                     AS "Дата поставки",
+            s.filial                            AS "Филиал",
+            s.zavod                             AS "Завод",
+            m.sys_nomer                         AS "Системный номер",
+            m.naimenovanie                      AS "Наименование материала",
+            m.ed_izm                            AS "Ед.изм",
+            sl.kolichestvo                      AS "Кол-во всего",
+            (sl.kolichestvo - sl.dostupno)      AS "Распределено",
+            sl.dostupno                         AS "Остаток",
+            sl.stoimost_za_ed                   AS "Стоимость за ед",
+            (sl.dostupno * sl.stoimost_za_ed)   AS "Сумма остатка"
+        FROM supply_lines sl
+        JOIN supplies s   ON s.id  = sl.supply_id
+        JOIN materials m  ON m.id  = sl.material_id
+        WHERE sl.dostupno > 0
+        ORDER BY s.data_postavki ASC NULLS LAST,
+                 s.dogovor,
+                 m.sys_nomer
+    """)
+    rows = session.execute(sql).fetchall()
+    if not rows:
+        return pd.DataFrame(columns=[
+            "Договор", "Поставщик", "Дата поставки", "Филиал", "Завод",
+            "Системный номер", "Наименование материала", "Ед.изм",
+            "Кол-во всего", "Распределено", "Остаток", "Стоимость за ед", "Сумма остатка",
+        ])
+    return pd.DataFrame(rows, columns=list(rows[0]._fields))
 
 
 # =============================================================================
