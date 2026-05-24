@@ -67,8 +67,9 @@ dev = [
 ]
 
 # Точка входа CLI: после установки можно запускать `maps` вместо `python main.py`
+# app.cli_entry — модуль внутри установленного пакета app (всегда в sys.path)
 [project.scripts]
-maps = "main:app"
+maps = "app.cli_entry:app"
 
 # Указываем setuptools, где искать исходный код пакета
 # py-modules: отдельные файлы (не пакеты) которые нужно зарегистрировать
