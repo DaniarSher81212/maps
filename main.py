@@ -32,6 +32,8 @@ main.py — Точка входа в систему MAPS (CLI)
 
     Утилиты:
         maps status               — состояние базы данных
+        maps sessions             — список сессий распределения
+        maps show SESSION_ID      — детали конкретной сессии
     ─────────────────────────────────────────────────────────────
 
 Рекомендуемый порядок работы:
@@ -659,6 +661,205 @@ def status() -> None:
     except Exception as e:
         console.print(f"[red]✗ Ошибка подключения к БД: {e}[/red]")
         raise typer.Exit(code=1)
+
+
+# =============================================================================
+# Команда: sessions — список сессий распределения
+# =============================================================================
+
+@app.command()
+def sessions(
+    limit: int = typer.Option(20, "--limit", "-n", help="Сколько последних сессий показать"),
+) -> None:
+    """
+    Показать список сессий распределения в виде таблицы.
+
+    Выводит все сессии начиная с последней: ID, статус, дату, количество
+    потребностей, строк распределения и записей дефицита.
+
+    Примеры:
+        maps sessions
+        maps sessions --limit 5
+    """
+    from sqlalchemy import text
+
+    from app.db.database import get_session as db_session
+
+    try:
+        with db_session() as session:
+            rows = session.execute(text("""
+                SELECT id, status, started_at, completed_at,
+                       total_requirements, total_allocated, total_deficit
+                FROM allocation_sessions
+                ORDER BY started_at DESC
+                LIMIT :limit
+            """), {"limit": limit}).fetchall()
+    except Exception as e:
+        console.print(f"[red]✗ Ошибка подключения к БД: {e}[/red]")
+        raise typer.Exit(code=1)
+
+    if not rows:
+        console.print("[yellow]Сессий пока нет. Запустите: maps allocate[/yellow]")
+        return
+
+    table = Table(title=f"Сессии распределения (последние {limit})")
+    table.add_column("ID сессии",         style="cyan",  no_wrap=True)
+    table.add_column("Статус",            justify="center")
+    table.add_column("Запущена",          no_wrap=True)
+    table.add_column("Завершена",         no_wrap=True)
+    table.add_column("Потребностей",      justify="right")
+    table.add_column("Распределено",      justify="right")
+    table.add_column("Дефицит",           justify="right")
+
+    for r in rows:
+        status_color = "green" if r.status == "completed" else "red"
+        deficit_color = "red" if (r.total_deficit or 0) > 0 else "green"
+        started   = str(r.started_at)[:19]   if r.started_at   else "—"
+        completed = str(r.completed_at)[:19] if r.completed_at else "—"
+        table.add_row(
+            r.id,
+            f"[{status_color}]{r.status}[/{status_color}]",
+            started,
+            completed,
+            str(r.total_requirements or 0),
+            str(r.total_allocated   or 0),
+            f"[{deficit_color}]{r.total_deficit or 0}[/{deficit_color}]",
+        )
+
+    console.print(table)
+    console.print(
+        f"\nДля деталей сессии: [cyan]maps show <ID_сессии>[/cyan]\n"
+        f"Для экспорта отчёта: [cyan]maps export <ID_сессии>[/cyan]"
+    )
+
+
+# =============================================================================
+# Команда: show — детальный просмотр одной сессии
+# =============================================================================
+
+@app.command()
+def show(
+    session_id: str = typer.Argument(..., help="ID сессии распределения"),
+) -> None:
+    """
+    Показать детальную информацию об одной сессии распределения.
+
+    Выводит:
+        - Общую статистику сессии
+        - Топ-10 материалов в дефиците
+        - Итоги по слоям покрытия
+
+    Примеры:
+        maps show 20260524_143000_abc12
+    """
+    from sqlalchemy import text
+
+    from app.db.database import get_session as db_session
+
+    try:
+        with db_session() as session:
+            # --- Общая информация о сессии ---
+            sess_row = session.execute(text("""
+                SELECT id, status, started_at, completed_at,
+                       total_requirements, total_allocated, total_deficit
+                FROM allocation_sessions
+                WHERE id = :sid
+            """), {"sid": session_id}).fetchone()
+
+            if sess_row is None:
+                console.print(f"[red]✗ Сессия не найдена: {session_id}[/red]")
+                console.print("Список сессий: [cyan]maps sessions[/cyan]")
+                raise typer.Exit(code=1)
+
+            # --- Топ дефицитных материалов ---
+            # deficit_records.material_id → materials напрямую
+            deficit_rows = session.execute(text("""
+                SELECT m.sys_nomer, m.naimenovanie, d.deficit_qty, m.ed_izm
+                FROM deficit_records d
+                JOIN materials m ON m.id = d.material_id
+                WHERE d.session_id = :sid
+                ORDER BY d.deficit_qty DESC
+                LIMIT 10
+            """), {"sid": session_id}).fetchall()
+
+            # --- Итоги по слоям ---
+            # allocation_results: istochnik = тип источника, kolichestvo = количество
+            layer_rows = session.execute(text("""
+                SELECT istochnik,
+                       COUNT(*)         AS cnt,
+                       SUM(kolichestvo) AS total_qty
+                FROM allocation_results
+                WHERE session_id = :sid
+                GROUP BY istochnik
+                ORDER BY istochnik
+            """), {"sid": session_id}).fetchall()
+
+    except typer.Exit:
+        raise
+    except Exception as e:
+        console.print(f"[red]✗ Ошибка: {e}[/red]")
+        raise typer.Exit(code=1)
+
+    # --- Вывод: шапка ---
+    status_color = "green" if sess_row.status == "completed" else "red"
+    console.print(Panel(
+        f"ID: [cyan]{sess_row.id}[/cyan]\n"
+        f"Статус: [{status_color}]{sess_row.status}[/{status_color}]\n"
+        f"Запущена:  {str(sess_row.started_at)[:19]   if sess_row.started_at   else '—'}\n"
+        f"Завершена: {str(sess_row.completed_at)[:19] if sess_row.completed_at else '—'}",
+        title="Сессия распределения",
+    ))
+
+    # --- Вывод: общая статистика ---
+    stats_table = Table(show_header=False, box=None, padding=(0, 2))
+    stats_table.add_column("Показатель", style="bold")
+    stats_table.add_column("Значение",   justify="right")
+    stats_table.add_row("Обработано потребностей", str(sess_row.total_requirements or 0))
+    stats_table.add_row("Строк распределения",     str(sess_row.total_allocated   or 0))
+    deficit_str = str(sess_row.total_deficit or 0)
+    deficit_color = "red" if (sess_row.total_deficit or 0) > 0 else "green"
+    stats_table.add_row(
+        "Позиций дефицита (К закупу)",
+        f"[{deficit_color}]{deficit_str}[/{deficit_color}]",
+    )
+    console.print(stats_table)
+
+    # --- Вывод: слои ---
+    if layer_rows:
+        # istochnik — русское название источника (напр. "Склад", "Поставки", "К закупу")
+        layer_table = Table(title="Итоги по слоям (источники покрытия)")
+        layer_table.add_column("Источник",         style="bold")
+        layer_table.add_column("Строк",            justify="right")
+        layer_table.add_column("Количество всего", justify="right")
+
+        for lr in layer_rows:
+            qty = f"{lr.total_qty:,.2f}" if lr.total_qty else "0"
+            layer_table.add_row(lr.istochnik or "—", str(lr.cnt), qty)
+        console.print(layer_table)
+
+    # --- Вывод: топ дефицита ---
+    if deficit_rows:
+        def_table = Table(title="Топ-10 материалов в дефиците")
+        def_table.add_column("Системный номер", style="cyan")
+        def_table.add_column("Наименование")
+        def_table.add_column("Дефицит",  justify="right", style="red")
+        def_table.add_column("Ед.изм",   justify="center")
+
+        for dr in deficit_rows:
+            naim = dr.naimenovanie or ""
+            def_table.add_row(
+                dr.sys_nomer,
+                naim[:50] + "…" if len(naim) > 50 else naim,
+                f"{dr.deficit_qty:,.2f}",
+                dr.ed_izm or "",
+            )
+        console.print(def_table)
+    else:
+        console.print("[green]✓ Дефицитных позиций нет![/green]")
+
+    console.print(
+        f"\nДля экспорта в Excel: [cyan]maps export {session_id}[/cyan]"
+    )
 
 
 # =============================================================================
