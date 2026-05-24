@@ -71,6 +71,11 @@ dev = [
 maps = "main:app"
 
 # Указываем setuptools, где искать исходный код пакета
+# py-modules: отдельные файлы (не пакеты) которые нужно зарегистрировать
+# main.py — точка входа CLI, должна быть доступна для импорта как модуль
+[tool.setuptools]
+py-modules = ["main"]
+
 # find: автоматически найдёт все папки с __init__.py (app/, tests/ и т.д.)
 [tool.setuptools.packages.find]
 where = ["."]
