@@ -31,6 +31,7 @@ from app.services.import_service import (
     import_requirements,
     import_stock,
     import_supplies,
+    import_works,      # Импорт перечня работ с наименованиями (мастер-данные)
     import_writeoffs,
 )
 
@@ -146,3 +147,41 @@ async def import_issued_endpoint(file: UploadFile = File(...)) -> dict:
         raise HTTPException(status_code=400, detail=str(e))
     finally:
         tmp.unlink(missing_ok=True)
+
+
+@router.post("/import/works")
+async def upload_works(file: UploadFile = File(...)) -> dict:
+    """
+    Загрузить перечень работ с наименованиями из Excel.
+
+    Что делает этот эндпоинт?
+        Принимает Excel-файл «Перечень работ» и передаёт его в import_works().
+        Работы создаются (если новые) или обновляются (если уже есть в БД).
+        Это операция upsert по коду работы (kod_raboty).
+
+    Когда вызывать?
+        Рекомендуется ДО загрузки потребностей (import/requirements),
+        чтобы при создании работ они сразу получили наименования.
+        Но можно и ПОСЛЕ — тогда наименования обновятся у существующих работ.
+
+    Не удаляет существующие данные — только добавляет или обновляет.
+
+    Формат файла:
+        Код работы | Наименование работы | Дата начала | Дата окончания |
+        Филиал | Завод | Приоритет | Статус | Тип работы
+
+    Returns:
+        {"status": "ok", "stats": {"created": 30, "updated": 20, "errors": 0}}
+    """
+    # Сохраняем загруженный файл во временный файл на диске
+    tmp_path = await _save_upload(file)
+    try:
+        # Запускаем импорт (синхронная функция, работает с БД через SQLAlchemy)
+        stats = import_works(tmp_path)
+        return {"status": "ok", "stats": stats}
+    except Exception as e:
+        # 422 Unprocessable Entity — данные приняты, но обработать не удалось
+        raise HTTPException(status_code=422, detail=str(e))
+    finally:
+        # Удаляем временный файл в любом случае (даже при ошибке)
+        tmp_path.unlink(missing_ok=True)

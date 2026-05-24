@@ -87,17 +87,19 @@ def export_allocation_results(
 
     # Запрашиваем данные из БД (одна открытая сессия для всех запросов)
     with get_session() as session:
-        df_main     = _get_wide_allocation_df(session, session_id)
-        df_movement = _get_movement_df(session, session_id)
-        df_balances = _get_warehouse_balances_df(session, session_id)
-        df_possible = _get_possible_movements_df(session, session_id)
+        df_main         = _get_wide_allocation_df(session, session_id)
+        df_movement     = _get_movement_df(session, session_id)
+        df_balances     = _get_warehouse_balances_df(session, session_id)
+        df_possible     = _get_possible_movements_df(session, session_id)
+        df_coverage     = _get_coverage_by_work_df(session, session_id)
 
-    # Записываем в Excel (4 листа)
+    # Записываем в Excel (5 листов)
     with pd.ExcelWriter(file_path, engine="openpyxl") as writer:
         _write_sheet(writer, df_main,     "Распределение")
         _write_sheet(writer, df_movement, "Движение склада")
         _write_sheet(writer, df_balances, "Остатки складов")
         _write_sheet(writer, df_possible, "Возможное перемещение")
+        _write_sheet(writer, df_coverage, "Обеспеченность")
 
     logger.info(
         "Отчёт создан: %s | строк в главной таблице: %d",
@@ -334,7 +336,7 @@ def _get_wide_allocation_df(session, session_id: str) -> pd.DataFrame:
     # ── Шаг 6: Формируем итоговую таблицу с понятными заголовками ──
     result = pd.DataFrame({
         # Признак аварийности
-        "Аварийная": df["is_emergency"].map({True: "Да", False: ""}),
+        "Аварийная": df["is_emergency"].apply(lambda x: "Да" if x else ""),
 
         # Данные работы
         "Приоритет":        df["prioritet"],
@@ -446,7 +448,7 @@ def _get_movement_df(session, session_id: str) -> pd.DataFrame:
 # Лист 3: Остатки складов после распределения
 # =============================================================================
 
-def _get_warehouse_balances_df(session, session_id: str = "") -> pd.DataFrame:  # noqa: ARG001
+def _get_warehouse_balances_df(session, _session_id: str = "") -> pd.DataFrame:
     """
     Текущие остатки по складам ПОСЛЕ распределения.
 
@@ -541,6 +543,123 @@ def _get_possible_movements_df(session, session_id: str) -> pd.DataFrame:
     """)
     rows = session.execute(sql, {"sid": session_id}).fetchall()
     return _to_df(rows)
+
+
+# =============================================================================
+# Лист 5: Обеспеченность по работам (сводная таблица)
+# =============================================================================
+
+def _get_coverage_by_work_df(session, session_id: str) -> pd.DataFrame:
+    """
+    Сформировать сводную таблицу обеспеченности по работам.
+
+    Что показывает этот лист?
+        По каждой работе (не по материалу!): насколько она обеспечена
+        материалами в целом (по стоимости).
+
+        Пример строки:
+            WO-12345 | Ремонт насоса | Алматы | 3 матер. | 5 млн | 3.2 млн | 1.8 млн | 64%
+
+    Формула обеспеченности % (ПО СТОИМОСТИ):
+        % = стоимость_обеспечено / стоимость_потребности × 100
+        Где стоимость_обеспечено = сумма всех НЕ-возможных (is_possible=FALSE) распределений.
+        Если стоимость потребности = 0 (прогнозные цены не заданы) → 0%.
+
+    Как считается стоимость потребности?
+        SUM(r.potrebnost × r.prognosnaya_tsena)
+        Суммируем по всем потребностям данной работы.
+
+    Как считается стоимость обеспечено?
+        Сумма ar.summa по allocation_results этой работы/сессии (is_possible=FALSE).
+        Включает слои 1 (списание), 2 (выдано), 3 (склад), 4 (поставки).
+        НЕ включает слой 5 (дефицит) и возможное перемещение (is_possible=TRUE).
+
+    Как считается стоимость дефицита?
+        SUM(dr.estimated_cost) из deficit_records.
+        estimated_cost = deficit_qty × prognosnaya_tsena.
+
+    Args:
+        session:    Сессия SQLAlchemy
+        session_id: ID сессии распределения
+
+    Returns:
+        DataFrame с одной строкой на работу (все работы, у которых есть потребности)
+    """
+    sql = text("""
+        SELECT
+            w.kod_raboty,
+            w.nazvanie,
+            w.filial,
+            w.zavod,
+            w.data_nachala,
+            w.data_okonchaniya,
+            w.is_emergency,
+            COUNT(r.id)                                         AS materials_count,
+            COALESCE(SUM(r.potrebnost * r.prognosnaya_tsena), 0) AS stoimost_potrebnosti,
+            COALESCE((
+                SELECT SUM(ar.summa)
+                FROM allocation_results ar
+                WHERE ar.work_id = w.id
+                  AND ar.session_id = :sid
+                  AND ar.is_possible = FALSE
+            ), 0)                                               AS stoimost_obespecheno,
+            COALESCE((
+                SELECT SUM(dr.estimated_cost)
+                FROM deficit_records dr
+                WHERE dr.work_id = w.id
+                  AND dr.session_id = :sid
+            ), 0)                                               AS stoimost_deficita
+        FROM works w
+        JOIN requirements r ON r.work_id = w.id
+        GROUP BY w.id, w.kod_raboty, w.nazvanie, w.filial, w.zavod,
+                 w.data_nachala, w.data_okonchaniya, w.is_emergency
+        ORDER BY w.data_nachala ASC NULLS LAST, w.kod_raboty
+    """)
+
+    rows = session.execute(sql, {"sid": session_id}).fetchall()
+
+    if not rows:
+        # Нет потребностей — возвращаем пустой DataFrame
+        return pd.DataFrame()
+
+    # Собираем DataFrame из сырых данных
+    df = pd.DataFrame(rows, columns=list(rows[0]._fields))
+
+    # Приводим числовые колонки к float (PostgreSQL возвращает Decimal)
+    for col in ["stoimost_potrebnosti", "stoimost_obespecheno", "stoimost_deficita"]:
+        df[col] = df[col].astype(float)
+
+    # --- Считаем % обеспеченности ---
+    # Если стоимость потребности > 0 — считаем процент по стоимости.
+    # Если = 0 (прогнозные цены не заданы) — процент равен 0.
+    df["coverage_pct"] = df.apply(
+        lambda row: (
+            round(float(row["stoimost_obespecheno"]) / float(row["stoimost_potrebnosti"]) * 100, 1)
+            if float(row["stoimost_potrebnosti"]) > 0
+            else 0.0
+        ),
+        axis=1,
+    )
+
+    # --- Формируем итоговую таблицу с русскими заголовками ---
+    result = pd.DataFrame({
+        "Код работы":           df["kod_raboty"],
+        # nazvanie может быть None → заменяем на пустую строку для читаемости
+        "Наименование работы":  df["nazvanie"].fillna(""),
+        "Филиал":               df["filial"].fillna(""),
+        "Завод":                df["zavod"].fillna(""),
+        "Дата начала":          df["data_nachala"],
+        "Дата окончания":       df["data_okonchaniya"],
+        # Булевое поле → "Да"/"Нет" для удобства чтения в Excel
+        "Аварийная":            df["is_emergency"].apply(lambda x: "Да" if x else "Нет"),
+        "Материалов":           df["materials_count"].astype(int),
+        "Стоимость потребности":  df["stoimost_potrebnosti"].round(2),
+        "Стоимость обеспечено":   df["stoimost_obespecheno"].round(2),
+        "Стоимость дефицита":     df["stoimost_deficita"].round(2),
+        "Обеспеченность %":       df["coverage_pct"],
+    })
+
+    return result
 
 
 # =============================================================================

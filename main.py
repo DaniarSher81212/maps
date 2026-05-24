@@ -260,6 +260,50 @@ def import_emergency_cmd(
     _print_import_stats("Аварийные работы", stats)
 
 
+@app.command(name="import-works")
+def import_works_cmd(
+    file: Path = typer.Argument(..., help="Путь к Excel файлу с перечнем работ"),
+    sheet: str = typer.Option("0", "--sheet", "-s", help="Имя или номер листа"),
+) -> None:
+    """
+    Импортировать перечень работ с наименованиями из Excel.
+
+    Файл содержит мастер-данные: наименование работы, даты начала/окончания,
+    филиал, завод. Работы создаются или обновляются (по коду работы).
+
+    Загружается ДО import-requirements чтобы при создании работ через потребности
+    наименования уже были в БД. Можно загружать и ПОСЛЕ — обновит существующие.
+
+    Не удаляет существующие данные — только добавляет/обновляет работы.
+    Поля обновляются только если в файле передано непустое значение.
+
+    Формат файла:
+        Код работы, Наименование работы, Дата начала, Дата окончания,
+        Филиал, Завод, Приоритет, Статус, Тип работы
+
+    Пример:
+        maps import-works data/works_list.xlsx
+        maps import-works data/works_list.xlsx --sheet "Перечень работ"
+    """
+    if not file.exists():
+        console.print(f"[red]✗ Файл не найден: {file}[/red]")
+        raise typer.Exit(code=1)
+
+    console.print(f"Импорт перечня работ из: [cyan]{file}[/cyan]")
+
+    from app.services.import_service import import_works
+
+    with console.status("Импортируем перечень работ..."):
+        try:
+            sheet_name: int | str = int(sheet) if sheet.isdigit() else sheet
+            stats = import_works(file, sheet_name=sheet_name)
+        except Exception as e:
+            console.print(f"[red]✗ Ошибка импорта: {e}[/red]")
+            raise typer.Exit(code=1)
+
+    _print_import_stats("Перечень работ", stats)
+
+
 @app.command(name="import-stock")
 def import_stock_cmd(
     file: Path = typer.Argument(..., help="Путь к Excel файлу со складскими остатками"),

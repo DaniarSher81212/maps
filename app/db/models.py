@@ -85,6 +85,12 @@ class Work(Base):
     # Уникальный бизнес-код работы (из SAP PS/PM)
     kod_raboty: Mapped[str] = mapped_column(String(100), nullable=False, unique=True)
 
+    # Наименование работы (описание/название из перечня работ).
+    # Загружается через import-works — отдельный файл «Перечень работ».
+    # Может быть None если перечень работ ещё не загружался.
+    # Используется в листе «Обеспеченность» Excel-отчёта.
+    nazvanie: Mapped[str | None] = mapped_column(Text)
+
     # Тип работы: "ТО", "Ремонт", "Монтаж", "Аварийный" и т.д.
     tip_raboty: Mapped[str | None] = mapped_column(String(100))
 

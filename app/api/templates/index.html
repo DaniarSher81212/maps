@@ -127,6 +127,25 @@
                     <!-- Аккордеон с формами загрузки файлов -->
                     <div class="accordion accordion-flush" id="importAccordion">
 
+                        <!-- Перечень работ — загружается ПЕРВЫМ (до потребностей) -->
+                        <!-- Содержит наименования и даты работ (мастер-данные) -->
+                        <div class="accordion-item import-card mb-2 rounded-3 overflow-hidden">
+                            <h2 class="accordion-header">
+                                <button class="accordion-button collapsed py-2" type="button"
+                                        data-bs-toggle="collapse" data-bs-target="#imp-works">
+                                    <i class="bi bi-list-check me-2 text-secondary"></i>
+                                    Перечень работ
+                                </button>
+                            </h2>
+                            <div id="imp-works" class="accordion-collapse collapse">
+                                <div class="accordion-body py-2">
+                                    <input type="file" class="form-control form-control-sm" accept=".xlsx,.xls"
+                                           onchange="uploadFile(this, '/api/import/works', 'res-works')">
+                                    <div id="res-works" class="upload-result"></div>
+                                </div>
+                            </div>
+                        </div>
+
                         <!-- Потребности -->
                         <div class="accordion-item import-card mb-2 rounded-3 overflow-hidden">
                             <h2 class="accordion-header">

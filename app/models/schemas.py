@@ -132,6 +132,77 @@ class WorkImportRow(MapsBaseModel):
         return self
 
 
+class WorkListImportRow(MapsBaseModel):
+    """
+    Схема строки файла «Перечень работ».
+
+    Что такое «Перечень работ»?
+        Отдельный Excel-файл, содержащий мастер-данные о работах:
+        наименование, даты, организационную структуру.
+        Это НЕ файл потребностей — здесь нет материалов и количеств.
+
+    Когда загружать?
+        Загружается ДО import-requirements, чтобы при создании работ
+        они сразу получили наименование и актуальные даты.
+        Можно загружать и ПОСЛЕ — тогда import-works обновит наименования.
+
+    Ключевое отличие от WorkImportRow:
+        WorkImportRow — строка файла потребностей (один материал для работы)
+        WorkListImportRow — строка файла перечня работ (одна работа, без материалов)
+
+    Формат Excel:
+        | Код работы | Наименование работы | Дата начала | Дата окончания |
+        | Филиал | Завод | Тип работы | Приоритет | Статус |
+    """
+    # Обязательные поля
+    # kod_raboty — это уникальный ключ работы в SAP (например "WO-12345")
+    kod_raboty: str = Field(..., description="Код работы", min_length=1)
+
+    # Необязательные поля — могут отсутствовать в файле
+    nazvanie: Optional[str] = None           # Наименование работы (человекочитаемое описание)
+
+    tip_raboty: Optional[str] = None         # Тип: "ТО", "Ремонт", "Монтаж" и т.д.
+    filial: Optional[str] = None             # Филиал компании
+    podrazdelenie: Optional[str] = None      # Подразделение внутри филиала
+    centr_zatrat: Optional[str] = None       # Центр затрат (CC) из SAP
+    zavod: Optional[str] = None              # Код завода (Plant) в SAP
+    data_nachala: Optional[date] = None      # Дата начала работы (влияет на приоритет!)
+    data_okonchaniya: Optional[date] = None  # Дата окончания / нужна к дате
+    prioritet: int = Field(default=3, ge=1, le=3)  # 1=высший, 2=средний, 3=низший
+    status: str = Field(default="active")           # "active", "completed", "cancelled"
+
+    @field_validator("kod_raboty", mode="before")
+    @classmethod
+    def strip_kod(cls, v: object) -> str:
+        """
+        Нормализация кода работы:
+            - убираем пробелы по краям (Excel часто добавляет пробелы)
+            - убираем суффикс '.0' (Excel форматирует числа как '12345.0')
+            - None → пустая строка (поле обязательное, Pydantic потом проверит min_length)
+        """
+        if v is None:
+            return ""
+        s = str(v).strip()
+        if s.endswith(".0"):
+            # Числовой код из Excel: "WO12345.0" → "WO12345"
+            s = s[:-2]
+        return s
+
+    @model_validator(mode="after")
+    def check_dates(self) -> "WorkListImportRow":
+        """
+        Проверяем логическую корректность дат:
+        дата начала не может быть позже даты окончания.
+
+        mode="after" — этот валидатор запускается ПОСЛЕ всех field_validator,
+        когда оба поля уже преобразованы в правильный тип (date или None).
+        """
+        if (self.data_nachala and self.data_okonchaniya
+                and self.data_nachala > self.data_okonchaniya):
+            raise ValueError("Дата начала не может быть позже даты окончания")
+        return self
+
+
 class WorkOut(MapsBaseModel):
     """Схема для вывода информации о работе (например, в API-ответе)."""
     id: int

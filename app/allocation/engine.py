@@ -56,7 +56,7 @@ app/allocation/engine.py — Ядро системы: алгоритм расп�
 """
 
 import uuid
-from datetime import datetime
+from datetime import date, datetime  # date нужен для проверки завершённости работы
 from decimal import ROUND_DOWN, Decimal
 from typing import Optional
 
@@ -355,6 +355,31 @@ class AllocationEngine:
             work.kod_raboty, material.sys_nomer, remaining,
         )
 
+        # ── Проверяем: завершена ли работа? ──
+        # Если дата окончания работы раньше сегодняшнего дня — работа завершена.
+        # Для завершённых работ закупать материалы уже не имеет смысла:
+        # они либо уже списаны (Слой 1), либо выданы (Слой 2), либо нет.
+        # Поэтому для завершённых работ обрабатываем только Слои 1 и 2,
+        # а Слои 3 (склад), 4 (поставки) и 5 (дефицит) — пропускаем.
+        is_completed = (
+            work.data_okonchaniya is not None                   # дата окончания указана
+            and work.data_okonchaniya < date.today()            # и она уже в прошлом
+        )
+
+        if is_completed:
+            # Для завершённой работы: применяем только фактически случившееся
+            # (то, что уже документально оформлено — Слои 1 и 2).
+            remaining = self._apply_writeoff_layer(req, work, material, remaining)
+            if remaining >= EPSILON:
+                remaining = self._apply_issued_layer(req, work, material, remaining)
+            # Дефицит не фиксируем — закупать уже незачем (работа завершена).
+            # Склад и поставки не резервируем — они нужны для будущих работ.
+            logger.debug(
+                "  [завершена] %s — пропускаем слои 3-5 (работа завершена %s)",
+                work.kod_raboty, work.data_okonchaniya,
+            )
+            return  # Выходим из метода, не обрабатывая слои 3-5
+
         # ── СЛОЙ 1: Фактические списания ──
         # Материалы, уже документально списанные на эту работу в SAP.
         remaining = self._apply_writeoff_layer(req, work, material, remaining)
@@ -422,8 +447,8 @@ class AllocationEngine:
             return remaining  # Списаний для этой пары нет — ничего не делаем
 
         # Суммируем все записи списания для этой работы+материала
-        total_qty = sum(wo.kolichestvo for wo in writeoffs)
-        total_summa = sum(wo.summa for wo in writeoffs)  # Общая сумма всех списаний
+        total_qty = sum((wo.kolichestvo for wo in writeoffs), Decimal("0"))
+        total_summa = sum((wo.summa for wo in writeoffs), Decimal("0"))  # Общая сумма всех списаний
 
         # Берём не больше, чем осталось (нельзя перекрыть потребность)
         qty = min(remaining, total_qty).quantize(Decimal("0.0001"), rounding=ROUND_DOWN)
@@ -500,8 +525,8 @@ class AllocationEngine:
             return remaining  # Нет записей «выдано» для этой пары
 
         # Суммируем все записи
-        total_qty = sum(item.kolichestvo for item in issued_list)
-        total_summa = sum(item.summa for item in issued_list)
+        total_qty = sum((item.kolichestvo for item in issued_list), Decimal("0"))
+        total_summa = sum((item.summa for item in issued_list), Decimal("0"))
 
         # Ограничиваем remaining
         qty = min(remaining, total_qty).quantize(Decimal("0.0001"), rounding=ROUND_DOWN)
