@@ -49,6 +49,7 @@ from app.core.logging_config import get_logger
 from app.db.database import get_session
 from app.db.models import (
     AllocationResult,
+    AllocationSession,
     DeficitRecord,
     IssuedNotWrittenOff,
     Requirement,
@@ -293,19 +294,23 @@ def import_requirements(file_path: Path, sheet_name: int | str = 0) -> dict[str,
         material_repo = MaterialRepository(session)
         req_repo = RequirementRepository(session)
 
-        # Полная замена: удаляем все плановые (не аварийные) работы и связанные данные.
-        # Порядок — от дочерних таблиц к родительским, чтобы не нарушить FK-ограничения.
-        from sqlalchemy import delete, select
+        # Полный сброс всех операционных данных — import-requirements начинает новый цикл.
+        # Порядок удаления: от дочерних таблиц к родительским (по FK-зависимостям).
+        # materials и warehouses не трогаем — это справочники, пересоздаются через get_or_create.
+        from sqlalchemy import delete
 
-        non_emergency_work_ids = select(Work.id).where(Work.is_emergency == False)
-        session.execute(delete(StockMovement).where(StockMovement.work_id.in_(non_emergency_work_ids)))
-        session.execute(delete(AllocationResult).where(AllocationResult.work_id.in_(non_emergency_work_ids)))
-        session.execute(delete(DeficitRecord).where(DeficitRecord.work_id.in_(non_emergency_work_ids)))
-        session.execute(delete(WriteOff).where(WriteOff.work_id.in_(non_emergency_work_ids)))
-        session.execute(delete(IssuedNotWrittenOff).where(IssuedNotWrittenOff.work_id.in_(non_emergency_work_ids)))
-        session.execute(delete(Requirement).where(Requirement.work_id.in_(non_emergency_work_ids)))
-        session.execute(delete(Work).where(Work.is_emergency == False))
-        logger.info("Удалены все плановые работы и связанные данные перед новым импортом")
+        session.execute(delete(StockMovement))
+        session.execute(delete(AllocationResult))
+        session.execute(delete(DeficitRecord))
+        session.execute(delete(AllocationSession))
+        session.execute(delete(WriteOff))
+        session.execute(delete(IssuedNotWrittenOff))
+        session.execute(delete(SupplyLine))
+        session.execute(delete(Supply))
+        session.execute(delete(StockBatch))
+        session.execute(delete(Requirement))
+        session.execute(delete(Work))
+        logger.info("Полный сброс операционных данных перед новым импортом")
 
         # Предзагружаем существующие работы и материалы в словари для O(1) поиска.
         # Это важная оптимизация: без неё импорт 10 000 строк = 10 000 SELECT-запросов.
@@ -432,19 +437,14 @@ def import_emergency_works(file_path: Path, sheet_name: int | str = 0) -> dict[s
         material_repo = MaterialRepository(session)
         req_repo = RequirementRepository(session)
 
-        # Полная замена: удаляем все аварийные работы и связанные данные.
-        # Порядок — от дочерних таблиц к родительским, чтобы не нарушить FK-ограничения.
+        # Удаляем только аварийные работы и их потребности —
+        # полный сброс базы уже выполнен командой import-requirements перед этим.
         from sqlalchemy import delete, select
 
         emergency_work_ids = select(Work.id).where(Work.is_emergency == True)
-        session.execute(delete(StockMovement).where(StockMovement.work_id.in_(emergency_work_ids)))
-        session.execute(delete(AllocationResult).where(AllocationResult.work_id.in_(emergency_work_ids)))
-        session.execute(delete(DeficitRecord).where(DeficitRecord.work_id.in_(emergency_work_ids)))
-        session.execute(delete(WriteOff).where(WriteOff.work_id.in_(emergency_work_ids)))
-        session.execute(delete(IssuedNotWrittenOff).where(IssuedNotWrittenOff.work_id.in_(emergency_work_ids)))
         session.execute(delete(Requirement).where(Requirement.work_id.in_(emergency_work_ids)))
         session.execute(delete(Work).where(Work.is_emergency == True))
-        logger.info("Удалены все аварийные работы и связанные данные перед новым импортом")
+        logger.info("Удалены аварийные работы перед новым импортом")
 
         existing_works = work_repo.get_kod_map()
         existing_materials = material_repo.get_id_map()

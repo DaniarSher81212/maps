@@ -28,12 +28,11 @@ main.py — Точка входа в систему MAPS (CLI)
 
     Алгоритм:
         maps allocate             — запустить распределение
-        maps export SESSION_ID    — экспортировать результаты в Excel
+        maps export               — экспортировать текущие результаты в Excel
 
     Утилиты:
         maps status               — состояние базы данных
-        maps sessions             — список сессий распределения
-        maps show SESSION_ID      — детали конкретной сессии
+        maps show                 — детали текущей сессии
     ─────────────────────────────────────────────────────────────
 
 Рекомендуемый порядок работы:
@@ -45,13 +44,13 @@ main.py — Точка входа в систему MAPS (CLI)
     6. maps import-writeoffs data/writeoffs.xlsx        (если есть)
     7. maps import-issued data/issued.xlsx              (если есть)
     8. maps allocate
-    9. maps export <ID_сессии>
+    9. maps export
 
 Примеры:
     python main.py init
     python main.py import-requirements data/sample_requirements.xlsx
     python main.py allocate --session "план_2026_06"
-    python main.py export 20260523_143000_abc12
+    python main.py export
 """
 
 from pathlib import Path
@@ -515,7 +514,7 @@ def allocate(
     console.print(table)
 
     console.print(f"\nДля экспорта в Excel:")
-    console.print(f"  [cyan]maps export {sid}[/cyan]")
+    console.print(f"  [cyan]maps export[/cyan]")
 
 
 # =============================================================================
@@ -524,14 +523,16 @@ def allocate(
 
 @app.command()
 def export(
-    session_id: str = typer.Argument(..., help="ID сессии распределения"),
     output_dir: Optional[str] = typer.Option(
         None, "--output", "-o",
         help=f"Папка для сохранения (по умолчанию: {settings.export_dir})"
     ),
 ) -> None:
     """
-    Экспортировать результаты распределения в Excel (4 листа).
+    Экспортировать результаты текущего распределения в Excel (4 листа).
+
+    Всегда экспортирует единственную (текущую) сессию.
+    Если распределение ещё не запускалось — сообщает об этом.
 
     Структура Excel-отчёта:
         1. «Распределение» — широкая таблица: все слои для каждой потребности.
@@ -540,13 +541,31 @@ def export(
         3. «Остатки складов» — что осталось на складах после распределения
         4. «Возможное перемещение» — анализ: склады других филиалов
 
-    Примеры:
-        maps export 20260523_143000_abc12
-        maps export 20260523_143000_abc12 --output /tmp/reports
+    Пример:
+        maps export
+        maps export --output /tmp/reports
     """
+    from sqlalchemy import text
+
+    from app.db.database import get_session
     from app.services.export_service import export_allocation_results
 
-    console.print(f"Экспорт сессии: [cyan]{session_id}[/cyan]")
+    # Находим единственную текущую сессию
+    try:
+        with get_session() as session:
+            row = session.execute(text(
+                "SELECT id FROM allocation_sessions ORDER BY started_at DESC LIMIT 1"
+            )).fetchone()
+    except Exception as e:
+        console.print(f"[red]✗ Ошибка подключения к БД: {e}[/red]")
+        raise typer.Exit(code=1)
+
+    if row is None:
+        console.print("[yellow]Нет данных для экспорта. Сначала запустите: maps allocate[/yellow]")
+        raise typer.Exit(code=1)
+
+    session_id = row[0]
+    console.print(f"Экспорт текущей сессии: [cyan]{session_id}[/cyan]")
 
     with console.status("Формируем Excel отчёт (4 листа)..."):
         try:
@@ -572,9 +591,7 @@ def status() -> None:
     """
     Показать текущее состояние базы данных MAPS.
 
-    Выводит:
-        - Количество записей в каждой таблице
-        - Последние 5 сессий распределения
+    Выводит количество записей в каждой таблице.
 
     Пример:
         maps status
@@ -624,133 +641,29 @@ def status() -> None:
 
             console.print(table)
 
-            # Последние 5 сессий распределения
-            try:
-                sessions = session.execute(text("""
-                    SELECT id, status, started_at,
-                           total_requirements, total_allocated, total_deficit
-                    FROM allocation_sessions
-                    ORDER BY started_at DESC
-                    LIMIT 5
-                """)).fetchall()
-
-                if sessions:
-                    sess_table = Table(title="Последние сессии распределения")
-                    sess_table.add_column("ID сессии")
-                    sess_table.add_column("Статус")
-                    sess_table.add_column("Дата запуска")
-                    sess_table.add_column("Потребностей", justify="right")
-                    sess_table.add_column("Распределено", justify="right")
-                    sess_table.add_column("Дефицит", justify="right")
-
-                    for s in sessions:
-                        status_color = "green" if s.status == "completed" else "red"
-                        deficit_color = "red" if s.total_deficit > 0 else "green"
-                        sess_table.add_row(
-                            s.id,
-                            f"[{status_color}]{s.status}[/{status_color}]",
-                            str(s.started_at)[:19],
-                            str(s.total_requirements),
-                            str(s.total_allocated),
-                            f"[{deficit_color}]{s.total_deficit}[/{deficit_color}]",
-                        )
-                    console.print(sess_table)
-            except Exception:
-                pass  # Таблица ещё не создана — пропускаем
-
     except Exception as e:
         console.print(f"[red]✗ Ошибка подключения к БД: {e}[/red]")
         raise typer.Exit(code=1)
 
 
 # =============================================================================
-# Команда: sessions — список сессий распределения
+# Команда: show — детальный просмотр текущей сессии
 # =============================================================================
 
 @app.command()
-def sessions(
-    limit: int = typer.Option(20, "--limit", "-n", help="Сколько последних сессий показать"),
-) -> None:
+def show() -> None:
     """
-    Показать список сессий распределения в виде таблицы.
-
-    Выводит все сессии начиная с последней: ID, статус, дату, количество
-    потребностей, строк распределения и записей дефицита.
-
-    Примеры:
-        maps sessions
-        maps sessions --limit 5
-    """
-    from sqlalchemy import text
-
-    from app.db.database import get_session as db_session
-
-    try:
-        with db_session() as session:
-            rows = session.execute(text("""
-                SELECT id, status, started_at, completed_at,
-                       total_requirements, total_allocated, total_deficit
-                FROM allocation_sessions
-                ORDER BY started_at DESC
-                LIMIT :limit
-            """), {"limit": limit}).fetchall()
-    except Exception as e:
-        console.print(f"[red]✗ Ошибка подключения к БД: {e}[/red]")
-        raise typer.Exit(code=1)
-
-    if not rows:
-        console.print("[yellow]Сессий пока нет. Запустите: maps allocate[/yellow]")
-        return
-
-    table = Table(title=f"Сессии распределения (последние {limit})")
-    table.add_column("ID сессии",         style="cyan",  no_wrap=True)
-    table.add_column("Статус",            justify="center")
-    table.add_column("Запущена",          no_wrap=True)
-    table.add_column("Завершена",         no_wrap=True)
-    table.add_column("Потребностей",      justify="right")
-    table.add_column("Распределено",      justify="right")
-    table.add_column("Дефицит",           justify="right")
-
-    for r in rows:
-        status_color = "green" if r.status == "completed" else "red"
-        deficit_color = "red" if (r.total_deficit or 0) > 0 else "green"
-        started   = str(r.started_at)[:19]   if r.started_at   else "—"
-        completed = str(r.completed_at)[:19] if r.completed_at else "—"
-        table.add_row(
-            r.id,
-            f"[{status_color}]{r.status}[/{status_color}]",
-            started,
-            completed,
-            str(r.total_requirements or 0),
-            str(r.total_allocated   or 0),
-            f"[{deficit_color}]{r.total_deficit or 0}[/{deficit_color}]",
-        )
-
-    console.print(table)
-    console.print(
-        f"\nДля деталей сессии: [cyan]maps show <ID_сессии>[/cyan]\n"
-        f"Для экспорта отчёта: [cyan]maps export <ID_сессии>[/cyan]"
-    )
-
-
-# =============================================================================
-# Команда: show — детальный просмотр одной сессии
-# =============================================================================
-
-@app.command()
-def show(
-    session_id: str = typer.Argument(..., help="ID сессии распределения"),
-) -> None:
-    """
-    Показать детальную информацию об одной сессии распределения.
+    Показать детальную информацию о текущей (единственной) сессии распределения.
 
     Выводит:
         - Общую статистику сессии
         - Топ-10 материалов в дефиците
         - Итоги по слоям покрытия
 
-    Примеры:
-        maps show 20260524_143000_abc12
+    Если распределение ещё не запускалось — сообщает об этом.
+
+    Пример:
+        maps show
     """
     from sqlalchemy import text
 
@@ -758,21 +671,22 @@ def show(
 
     try:
         with db_session() as session:
-            # --- Общая информация о сессии ---
+            # --- Находим текущую (единственную) сессию ---
             sess_row = session.execute(text("""
                 SELECT id, status, started_at, completed_at,
                        total_requirements, total_allocated, total_deficit
                 FROM allocation_sessions
-                WHERE id = :sid
-            """), {"sid": session_id}).fetchone()
+                ORDER BY started_at DESC
+                LIMIT 1
+            """)).fetchone()
 
             if sess_row is None:
-                console.print(f"[red]✗ Сессия не найдена: {session_id}[/red]")
-                console.print("Список сессий: [cyan]maps sessions[/cyan]")
-                raise typer.Exit(code=1)
+                console.print("[yellow]Нет данных. Сначала запустите: maps allocate[/yellow]")
+                raise typer.Exit(code=0)
+
+            session_id = sess_row.id
 
             # --- Топ дефицитных материалов ---
-            # deficit_records.material_id → materials напрямую
             deficit_rows = session.execute(text("""
                 SELECT m.sys_nomer, m.naimenovanie, d.deficit_qty, m.ed_izm
                 FROM deficit_records d
@@ -807,7 +721,7 @@ def show(
         f"Статус: [{status_color}]{sess_row.status}[/{status_color}]\n"
         f"Запущена:  {str(sess_row.started_at)[:19]   if sess_row.started_at   else '—'}\n"
         f"Завершена: {str(sess_row.completed_at)[:19] if sess_row.completed_at else '—'}",
-        title="Сессия распределения",
+        title="Текущая сессия распределения",
     ))
 
     # --- Вывод: общая статистика ---
@@ -826,7 +740,7 @@ def show(
 
     # --- Вывод: слои ---
     if layer_rows:
-        # istochnik — русское название источника (напр. "Склад", "Поставки", "К закупу")
+        # istochnik — название источника (напр. "sklad", "postavka", "deficit")
         layer_table = Table(title="Итоги по слоям (источники покрытия)")
         layer_table.add_column("Источник",         style="bold")
         layer_table.add_column("Строк",            justify="right")
@@ -858,7 +772,7 @@ def show(
         console.print("[green]✓ Дефицитных позиций нет![/green]")
 
     console.print(
-        f"\nДля экспорта в Excel: [cyan]maps export {session_id}[/cyan]"
+        f"\nДля экспорта в Excel: [cyan]maps export[/cyan]"
     )
 
 

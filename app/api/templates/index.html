@@ -18,12 +18,6 @@
         .stat-card { border: none; border-radius: 12px; box-shadow: 0 2px 8px rgba(0,0,0,.08); }
         .stat-card .display-6 { font-weight: 700; }
 
-        /* Таблица сессий */
-        .sessions-table td { vertical-align: middle; }
-        .badge-running  { background-color: #ffc107; color: #000; }
-        .badge-completed{ background-color: #198754; }
-        .badge-failed   { background-color: #dc3545; }
-
         /* Кнопка «Запустить распределение» */
         .btn-allocate { font-size: 1.1rem; padding: 0.6rem 2rem; border-radius: 8px; }
 
@@ -40,17 +34,6 @@
         /* AI-анализ */
         .ai-card { border: none; border-radius: 12px; box-shadow: 0 2px 8px rgba(0,0,0,.08); }
         .ai-explanation { white-space: pre-wrap; line-height: 1.8; font-size: 0.95rem; }
-
-        /* RAG-чат */
-        .chat-box { height: 360px; overflow-y: auto; background: #f8f9fa; border-radius: 10px; padding: 1rem; }
-        .chat-msg { margin-bottom: 0.75rem; max-width: 88%; }
-        .chat-msg.user { margin-left: auto; }
-        .chat-msg.user .bubble { background: #0d6efd; color: #fff; border-radius: 14px 14px 4px 14px; }
-        .chat-msg.assistant .bubble { background: #fff; border: 1px solid #dee2e6; border-radius: 14px 14px 14px 4px; }
-        .bubble { padding: 0.6rem 0.9rem; font-size: 0.9rem; white-space: pre-wrap; line-height: 1.6; }
-        .chat-meta { font-size: 0.72rem; color: #aaa; margin-top: 3px; }
-        .chat-msg.user .chat-meta { text-align: right; }
-        .chat-input-row { display: flex; gap: 0.5rem; margin-top: 0.75rem; }
     </style>
 </head>
 <body>
@@ -69,35 +52,29 @@
     <!-- =========================== КАРТОЧКИ СТАТУСА ==================== -->
     <div class="row g-3 mb-4" id="status-cards">
         <!-- Заполняются через JavaScript (fetch /api/status) -->
-        <div class="col-6 col-md-3">
+        <div class="col-6 col-md-4">
             <div class="stat-card card p-3 h-100">
                 <div class="text-muted small mb-1"><i class="bi bi-briefcase me-1"></i>Активных работ</div>
                 <div class="display-6" id="stat-works">—</div>
             </div>
         </div>
-        <div class="col-6 col-md-3">
+        <div class="col-6 col-md-4">
             <div class="stat-card card p-3 h-100">
                 <div class="text-muted small mb-1"><i class="bi bi-box-seam me-1"></i>Материалов</div>
                 <div class="display-6" id="stat-materials">—</div>
             </div>
         </div>
-        <div class="col-6 col-md-3">
+        <div class="col-6 col-md-4">
             <div class="stat-card card p-3 h-100">
                 <div class="text-muted small mb-1"><i class="bi bi-building me-1"></i>Партий на складе</div>
                 <div class="display-6" id="stat-batches">—</div>
-            </div>
-        </div>
-        <div class="col-6 col-md-3">
-            <div class="stat-card card p-3 h-100">
-                <div class="text-muted small mb-1"><i class="bi bi-clock-history me-1"></i>Последний запуск</div>
-                <div class="fs-6 fw-semibold mt-1" id="stat-last-session">—</div>
             </div>
         </div>
     </div>
 
     <div class="row g-4">
 
-        <!-- ====================== ЛЕВАЯ КОЛОНКА: ЗАПУСК + СЕССИИ ======= -->
+        <!-- ====================== ЛЕВАЯ КОЛОНКА: ЗАПУСК ================ -->
         <div class="col-lg-7">
 
             <!-- Кнопка запуска -->
@@ -107,6 +84,7 @@
                     <p class="text-muted small mb-3">
                         Алгоритм обработает все активные работы по 5 слоям покрытия:
                         списание → выдано → склад → поставки → дефицит.
+                        Предыдущий результат заменяется новым.
                     </p>
                     <button id="btn-allocate" class="btn btn-success btn-allocate" onclick="runAllocation()">
                         <i class="bi bi-lightning-charge-fill me-2"></i>Запустить распределение
@@ -114,47 +92,25 @@
                     <div id="allocate-status" class="mt-3 d-none">
                         <div class="alert alert-info py-2 mb-0">
                             <span class="spinner-border spinner-border-sm me-2"></span>
-                            Распределение выполняется... Таблица обновляется автоматически.
+                            Распределение выполняется... Статус обновляется автоматически.
                         </div>
                     </div>
                     <div id="allocate-done" class="mt-3 d-none">
                         <div class="alert alert-success py-2 mb-0">
                             <i class="bi bi-check-circle-fill me-2"></i>
-                            Распределение завершено. Скачайте отчёт из таблицы ниже.
+                            Распределение завершено. Скачайте отчёт ниже.
                         </div>
                     </div>
                 </div>
             </div>
 
-            <!-- Таблица сессий -->
-            <div class="card border-0 shadow-sm rounded-3">
-                <div class="card-header bg-white border-bottom py-3 d-flex justify-content-between align-items-center">
-                    <h6 class="mb-0"><i class="bi bi-table me-2"></i>История запусков</h6>
-                    <button class="btn btn-sm btn-outline-secondary" onclick="loadSessions()">
-                        <i class="bi bi-arrow-clockwise"></i> Обновить
-                    </button>
+            <!-- Текущая сессия / кнопка экспорта -->
+            <div class="card border-0 shadow-sm rounded-3" id="current-session-card">
+                <div class="card-header bg-white border-bottom py-3">
+                    <h6 class="mb-0"><i class="bi bi-bar-chart-line me-2"></i>Текущие результаты</h6>
                 </div>
-                <div class="card-body p-0">
-                    <div class="table-responsive">
-                        <table class="table sessions-table mb-0 small">
-                            <thead class="table-light">
-                                <tr>
-                                    <th>Время</th>
-                                    <th>Статус</th>
-                                    <th class="text-end">Потребностей</th>
-                                    <th class="text-end">Дефицит</th>
-                                    <th class="text-center">Отчёт</th>
-                                </tr>
-                            </thead>
-                            <tbody id="sessions-tbody">
-                                <tr>
-                                    <td colspan="5" class="text-center text-muted py-4">
-                                        <span class="spinner-border spinner-border-sm me-2"></span>Загрузка...
-                                    </td>
-                                </tr>
-                            </tbody>
-                        </table>
-                    </div>
+                <div class="card-body p-4" id="current-session-body">
+                    <p class="text-muted">Распределение ещё не выполнялось.</p>
                 </div>
             </div>
 
@@ -291,80 +247,20 @@
 
     </div><!-- /row -->
 
-    <!-- ============================ RAG-ЧАТ ================================ -->
-    <div class="ai-card card p-4 mt-2 mb-4">
-        <h5 class="fw-bold mb-1">
-            <i class="bi bi-chat-dots me-2 text-success"></i>Вопросы по истории распределений
-        </h5>
-        <p class="text-muted small mb-3">
-            Спрашивайте на русском: «Когда последний раз был дефицит по кабелю?»,
-            «Какой материал чаще всего в дефиците?», «Сравни последние сессии» и т.д.
-        </p>
-
-        <!-- Область сообщений -->
-        <div class="chat-box" id="chat-box">
-            <div class="chat-msg assistant">
-                <div class="bubble">Привет! Я могу ответить на вопросы по истории сессий распределения MAPS.
-Спросите, например:
-• «Какие материалы были в дефиците?»
-• «Когда последний раз не хватало цемента?»
-• «Сравни сессии по количеству дефицитов»</div>
-            </div>
-        </div>
-
-        <!-- Поле ввода -->
-        <div class="chat-input-row">
-            <input type="text" class="form-control" id="chat-input"
-                   placeholder="Задайте вопрос по истории сессий…"
-                   onkeydown="if(event.key==='Enter' && !event.shiftKey){ event.preventDefault(); sendChat(); }">
-            <button class="btn btn-success px-3" onclick="sendChat()" id="btn-chat">
-                <i class="bi bi-send"></i>
-            </button>
-        </div>
-        <div class="text-muted small mt-1" id="chat-meta-hint"></div>
-    </div>
-
     <!-- ======================= AI-АНАЛИЗ ДЕФИЦИТА ======================== -->
-    <div class="ai-card card p-4 mt-2 mb-4">
+    <div class="ai-card card p-4 mt-4 mb-4">
         <h5 class="fw-bold mb-1">
             <i class="bi bi-robot me-2 text-primary"></i>AI-анализ дефицита
         </h5>
         <p class="text-muted small mb-3">
-            Выберите сессию и материал — Claude объяснит причину дефицита и даст рекомендацию.
-            Или запустите прогноз — Claude оценит риски по всем материалам сразу.
+            Выберите материал с дефицитом — Claude объяснит причину и даст рекомендацию.
         </p>
 
-        <!-- Кнопка прогноза -->
-        <div class="mb-3">
-            <button class="btn btn-outline-primary" onclick="runForecast()" id="btn-forecast">
-                <i class="bi bi-graph-up-arrow me-1"></i>Прогноз дефицита
-                <span class="text-muted small ms-1">(последние 5 сессий)</span>
-            </button>
-        </div>
-
-        <!-- Результат прогноза -->
-        <div id="forecast-loading" class="d-none text-muted small py-2">
-            <div class="spinner-border spinner-border-sm text-primary me-2"></div>
-            Claude анализирует историю и остатки…
-        </div>
-        <div id="forecast-result" class="d-none">
-            <div class="bg-light rounded-3 p-3 ai-explanation mb-4" id="forecast-text"></div>
-        </div>
-        <div id="forecast-error" class="alert alert-danger d-none mb-3"></div>
-
-        <hr class="my-3">
-
         <div class="row g-3 align-items-end">
-            <div class="col-md-4">
-                <label class="form-label small text-muted fw-semibold mb-1">Сессия распределения</label>
-                <select class="form-select" id="ai-session" onchange="loadDeficitMaterials()">
-                    <option value="">— выберите сессию —</option>
-                </select>
-            </div>
-            <div class="col-md-5">
+            <div class="col-md-7">
                 <label class="form-label small text-muted fw-semibold mb-1">Материал с дефицитом</label>
-                <select class="form-select" id="ai-material" disabled onchange="document.getElementById('btn-explain').disabled = !this.value">
-                    <option value="">— сначала выберите сессию —</option>
+                <select class="form-select" id="ai-material" onchange="document.getElementById('btn-explain').disabled = !this.value">
+                    <option value="">— сначала запустите распределение —</option>
                 </select>
             </div>
             <div class="col-md-3">
@@ -407,8 +303,7 @@
 // Инициализация страницы
 // ============================================================================
 document.addEventListener("DOMContentLoaded", () => {
-    loadStatus();    // Загрузить статистику в карточки
-    loadSessions();  // Загрузить историю запусков в таблицу
+    loadStatus();    // Загрузить статистику и текущую сессию
     updateTime();    // Показывать текущее время в навбаре
     setInterval(updateTime, 1000);
 });
@@ -419,8 +314,10 @@ function updateTime() {
 }
 
 // ============================================================================
-// Загрузка статуса системы (GET /api/status)
+// Загрузка статуса системы и текущей сессии (GET /api/status)
 // ============================================================================
+let pollingTimer = null;  // Таймер опроса во время выполнения распределения
+
 async function loadStatus() {
     try {
         const r = await fetch("/api/status");
@@ -430,100 +327,75 @@ async function loadStatus() {
         document.getElementById("stat-materials").textContent  = d.materials.toLocaleString("ru");
         document.getElementById("stat-batches").textContent    = d.available_batches.toLocaleString("ru");
 
-        // Последняя сессия: показываем статус и время
-        const el = document.getElementById("stat-last-session");
-        if (d.last_session) {
-            const s = d.last_session;
-            const badge = statusBadge(s.status);
-            const dt = s.completed_at
-                ? new Date(s.completed_at).toLocaleString("ru-RU")
-                : "в процессе...";
-            el.innerHTML = `${badge} <span class="text-muted fw-normal">${dt}</span>`;
-        } else {
-            el.textContent = "Нет данных";
-        }
+        // Обновляем карточку текущей сессии
+        updateCurrentSessionCard(d.current_session);
     } catch(e) {
         console.error("Ошибка загрузки статуса:", e);
     }
 }
 
-// ============================================================================
-// Загрузка таблицы сессий (GET /api/sessions)
-// ============================================================================
-let pollingTimer = null;  // Таймер опроса во время выполнения распределения
+// Обновить карточку текущих результатов
+function updateCurrentSessionCard(s) {
+    const body = document.getElementById("current-session-body");
 
-async function loadSessions() {
-    try {
-        const r = await fetch("/api/sessions");
-        const sessions = await r.json();
+    if (!s) {
+        body.innerHTML = `<p class="text-muted">Распределение ещё не выполнялось.</p>`;
+        return;
+    }
 
-        const tbody = document.getElementById("sessions-tbody");
+    const dt = s.started_at
+        ? new Date(s.started_at).toLocaleString("ru-RU")
+        : "—";
 
-        if (sessions.length === 0) {
-            tbody.innerHTML = `<tr><td colspan="5" class="text-center text-muted py-4">
-                Нет сессий. Запустите распределение.</td></tr>`;
-            return;
+    const deficitColor = s.total_deficit > 0 ? "text-danger" : "text-success";
+    const badge = statusBadge(s.status);
+
+    const downloadBtn = s.status === "completed"
+        ? `<a href="/api/export/${s.id}" class="btn btn-success mt-3">
+               <i class="bi bi-file-earmark-excel me-1"></i>Скачать Excel-отчёт
+           </a>`
+        : "";
+
+    body.innerHTML = `
+        <div class="mb-2">${badge} <span class="text-muted small">${dt}</span></div>
+        <div class="row g-3 text-center mb-3">
+            <div class="col-4">
+                <div class="text-muted small">Потребностей</div>
+                <div class="fs-5 fw-bold">${(s.total_requirements||0).toLocaleString("ru")}</div>
+            </div>
+            <div class="col-4">
+                <div class="text-muted small">Распределено</div>
+                <div class="fs-5 fw-bold">${(s.total_allocated||0).toLocaleString("ru")}</div>
+            </div>
+            <div class="col-4">
+                <div class="text-muted small">Дефицит</div>
+                <div class="fs-5 fw-bold ${deficitColor}">${(s.total_deficit||0).toLocaleString("ru")}</div>
+            </div>
+        </div>
+        ${downloadBtn}
+    `;
+
+    // Если сессия в процессе — опрашиваем каждые 3 сек через loadStatus
+    if (s.status === "running") {
+        if (!pollingTimer) {
+            pollingTimer = setInterval(loadStatus, 3000);
         }
-
-        tbody.innerHTML = sessions.map(s => {
-            // Время запуска (только дата и время, без секунд)
-            const dt = s.started_at
-                ? new Date(s.started_at).toLocaleString("ru-RU", {
-                    day:"2-digit", month:"2-digit", year:"2-digit",
-                    hour:"2-digit", minute:"2-digit"
-                  })
-                : "—";
-
-            // Кнопка скачивания (только для завершённых сессий)
-            const downloadBtn = s.status === "completed"
-                ? `<a href="/api/export/${s.id}" class="btn btn-sm btn-outline-success py-0 px-2" title="Скачать Excel-отчёт">
-                       <i class="bi bi-file-earmark-excel"></i> Скачать
-                   </a>`
-                : `<span class="text-muted">—</span>`;
-
-            // Строка дефицита (красным если > 0)
-            const deficitCell = s.total_deficit > 0
-                ? `<span class="text-danger fw-semibold">${s.total_deficit.toLocaleString("ru")}</span>`
-                : `<span class="text-muted">${s.total_deficit}</span>`;
-
-            return `<tr>
-                <td class="text-muted">${dt}</td>
-                <td>${statusBadge(s.status)}</td>
-                <td class="text-end">${(s.total_requirements||0).toLocaleString("ru")}</td>
-                <td class="text-end">${deficitCell}</td>
-                <td class="text-center">${downloadBtn}</td>
-            </tr>`;
-        }).join("");
-
-        // Заполняем дропдаун сессий для AI-анализа
-        populateAiSessions(sessions);
-
-        // Если есть сессия со статусом 'running' — опрашиваем каждые 3 сек
-        const hasRunning = sessions.some(s => s.status === "running");
-        if (hasRunning) {
-            if (!pollingTimer) {
-                pollingTimer = setInterval(() => {
-                    loadSessions();
-                    loadStatus();
-                }, 3000);
-            }
-        } else {
-            // Все завершились — останавливаем опрос
-            if (pollingTimer) {
-                clearInterval(pollingTimer);
-                pollingTimer = null;
-                // Показываем уведомление «готово»
-                document.getElementById("allocate-status").classList.add("d-none");
-                document.getElementById("allocate-done").classList.remove("d-none");
-                document.getElementById("btn-allocate").disabled = false;
-                setTimeout(() => {
-                    document.getElementById("allocate-done").classList.add("d-none");
-                }, 8000);
+    } else {
+        // Завершилась — останавливаем опрос
+        if (pollingTimer) {
+            clearInterval(pollingTimer);
+            pollingTimer = null;
+            document.getElementById("allocate-status").classList.add("d-none");
+            document.getElementById("allocate-done").classList.remove("d-none");
+            document.getElementById("btn-allocate").disabled = false;
+            setTimeout(() => {
+                document.getElementById("allocate-done").classList.add("d-none");
+            }, 8000);
+            // Загружаем материалы с дефицитом для AI-анализа
+            if (s.total_deficit > 0) {
+                loadDeficitMaterials(s.id);
             }
         }
-
-    } catch(e) {
-        console.error("Ошибка загрузки сессий:", e);
     }
 }
 
@@ -540,7 +412,6 @@ async function runAllocation() {
     try {
         await fetch("/api/allocate", { method: "POST" });
         // Сразу опрашиваем — сессия уже создана в БД
-        loadSessions();
         loadStatus();
     } catch(e) {
         btn.disabled = false;
@@ -586,164 +457,22 @@ async function uploadFile(input, endpoint, resultId) {
 }
 
 // ============================================================================
-// AI-анализ дефицита
+// AI-анализ дефицита — загрузка материалов текущей сессии
 // ============================================================================
 
-// ============================================================================
-// RAG-чат по истории сессий
-// ============================================================================
-
-// История беседы — для уточняющих вопросов
-let chatHistory = [];
-
-function appendChatMessage(role, text, meta) {
-    const box = document.getElementById("chat-box");
-    const div = document.createElement("div");
-    div.className = `chat-msg ${role}`;
-
-    const bubble = document.createElement("div");
-    bubble.className = "bubble";
-    bubble.textContent = text;
-    div.appendChild(bubble);
-
-    if (meta) {
-        const m = document.createElement("div");
-        m.className = "chat-meta";
-        m.textContent = meta;
-        div.appendChild(m);
-    }
-
-    box.appendChild(div);
-    box.scrollTop = box.scrollHeight;  // Прокрутка вниз
-}
-
-async function sendChat() {
-    const input = document.getElementById("chat-input");
-    const btn = document.getElementById("btn-chat");
-    const question = input.value.trim();
-    if (!question) return;
-
-    // Показываем вопрос
-    appendChatMessage("user", question, null);
-    input.value = "";
-    btn.disabled = true;
-
-    // Показываем индикатор загрузки
-    const box = document.getElementById("chat-box");
-    const loadingDiv = document.createElement("div");
-    loadingDiv.className = "chat-msg assistant";
-    loadingDiv.id = "chat-loading-msg";
-    loadingDiv.innerHTML = `<div class="bubble text-muted">
-        <span class="spinner-border spinner-border-sm me-1"></span> Claude думает…
-    </div>`;
-    box.appendChild(loadingDiv);
-    box.scrollTop = box.scrollHeight;
-
-    try {
-        const r = await fetch("/api/ai/chat", {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ question, history: chatHistory }),
-        });
-        const d = await r.json();
-
-        // Убираем индикатор
-        document.getElementById("chat-loading-msg")?.remove();
-
-        if (!r.ok) throw new Error(d.detail || "Ошибка чата");
-
-        const meta = `Использовано сессий: ${d.sessions_used} из ${d.total_sessions}`;
-        appendChatMessage("assistant", d.answer, meta);
-        document.getElementById("chat-meta-hint").textContent = "";
-
-        // Сохраняем в историю (без контекста — только диалог)
-        chatHistory.push({ role: "user", content: question });
-        chatHistory.push({ role: "assistant", content: d.answer });
-        // Ограничиваем историю последними 10 парами
-        if (chatHistory.length > 20) chatHistory = chatHistory.slice(-20);
-
-    } catch(e) {
-        document.getElementById("chat-loading-msg")?.remove();
-        appendChatMessage("assistant", "Ошибка: " + e.message, null);
-    } finally {
-        btn.disabled = false;
-        input.focus();
-    }
-}
-
-// ============================================================================
-// Прогноз дефицита
-// ============================================================================
-
-async function runForecast() {
-    const btn = document.getElementById("btn-forecast");
-    btn.disabled = true;
-
-    document.getElementById("forecast-result").classList.add("d-none");
-    document.getElementById("forecast-error").classList.add("d-none");
-    document.getElementById("forecast-loading").classList.remove("d-none");
-
-    try {
-        const r = await fetch("/api/ai/forecast?sessions=5");
-        const d = await r.json();
-
-        if (!r.ok) throw new Error(d.detail || "Ошибка прогноза");
-
-        document.getElementById("forecast-text").textContent = d.forecast;
-        document.getElementById("forecast-result").classList.remove("d-none");
-
-    } catch(e) {
-        const errEl = document.getElementById("forecast-error");
-        errEl.textContent = "Ошибка: " + e.message;
-        errEl.classList.remove("d-none");
-    } finally {
-        document.getElementById("forecast-loading").classList.add("d-none");
-        btn.disabled = false;
-    }
-}
-
-// Заполняем дропдаун сессий (только завершённые с дефицитом)
-function populateAiSessions(sessions) {
-    const sel = document.getElementById("ai-session");
-    const current = sel.value;  // Сохраняем текущий выбор при перезагрузке
-
-    const withDeficit = sessions.filter(s => s.status === "completed" && s.total_deficit > 0);
-
-    sel.innerHTML = '<option value="">— выберите сессию —</option>';
-    withDeficit.forEach(s => {
-        const dt = s.started_at
-            ? new Date(s.started_at).toLocaleString("ru-RU", {
-                day: "2-digit", month: "2-digit", hour: "2-digit", minute: "2-digit"
-              })
-            : s.id;
-        const opt = document.createElement("option");
-        opt.value = s.id;
-        opt.textContent = `${dt} — дефицит ${s.total_deficit}`;
-        if (s.id === current) opt.selected = true;
-        sel.appendChild(opt);
-    });
-}
-
-// Загружаем список материалов с дефицитом для выбранной сессии
-async function loadDeficitMaterials() {
-    const sessionId = document.getElementById("ai-session").value;
+async function loadDeficitMaterials(sessionId) {
     const matSel = document.getElementById("ai-material");
     const btnExplain = document.getElementById("btn-explain");
 
-    // Сбрасываем результат при смене сессии
+    // Сброс при новой загрузке
     document.getElementById("ai-result").classList.add("d-none");
     document.getElementById("ai-error").classList.add("d-none");
-
-    if (!sessionId) {
-        matSel.disabled = true;
-        matSel.innerHTML = '<option value="">— сначала выберите сессию —</option>';
-        btnExplain.disabled = true;
-        return;
-    }
-
     matSel.disabled = true;
     matSel.innerHTML = '<option value="">Загрузка списка материалов…</option>';
     btnExplain.disabled = true;
+
+    // Сохраняем session_id для explainDeficit()
+    matSel.dataset.sessionId = sessionId;
 
     try {
         const r = await fetch(`/api/ai/deficits/${sessionId}`);
@@ -761,15 +490,16 @@ async function loadDeficitMaterials() {
         matSel.disabled = false;
 
     } catch(e) {
-        matSel.innerHTML = '<option value="">Дефицита нет в этой сессии</option>';
+        matSel.innerHTML = '<option value="">Дефицита нет в текущей сессии</option>';
         matSel.disabled = true;
     }
 }
 
-// Запрос AI-объяснения
+// Запрос AI-объяснения (POST /api/ai/explain)
 async function explainDeficit() {
-    const sessionId  = document.getElementById("ai-session").value;
-    const materialId = document.getElementById("ai-material").value;
+    const matSel    = document.getElementById("ai-material");
+    const sessionId = matSel.dataset.sessionId;
+    const materialId = matSel.value;
     if (!sessionId || !materialId) return;
 
     // Сброс UI

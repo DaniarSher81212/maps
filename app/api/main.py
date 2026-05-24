@@ -8,10 +8,8 @@ app/api/main.py — Главный FastAPI-модуль MAPS
 
 Структура приложения:
     GET  /                          — HTML-дашборд (главная страница)
-    GET  /api/status                — статус системы (JSON)
+    GET  /api/status                — статус системы + текущая сессия (JSON)
     POST /api/allocate              — запустить распределение (JSON)
-    GET  /api/sessions              — список сессий (JSON)
-    GET  /api/sessions/{id}         — детали сессии (JSON)
     POST /api/import/requirements   — загрузить потребности (multipart)
     POST /api/import/emergency      — загрузить аварийные работы (multipart)
     POST /api/import/stock          — загрузить остатки (multipart)
@@ -19,6 +17,8 @@ app/api/main.py — Главный FastAPI-модуль MAPS
     POST /api/import/writeoffs      — загрузить списания (multipart)
     POST /api/import/issued         — загрузить выдано не списано (multipart)
     GET  /api/export/{session_id}   — скачать Excel-отчёт (file download)
+    GET  /api/ai/deficits/{sid}     — список дефицитных материалов (JSON)
+    POST /api/ai/explain            — AI-объяснение дефицита (JSON)
     GET  /docs                      — автодокументация Swagger UI
 
 Запуск:
@@ -71,7 +71,7 @@ def dashboard(request: Request) -> HTMLResponse:
 
     Request нужен Jinja2 для рендеринга шаблона (передаётся внутрь как контекст).
     Данные для карточек статуса и таблицы сессий загружаются через JavaScript
-    (fetch /api/status и /api/sessions) — так страница работает быстро.
+    (fetch /api/status) — так страница работает быстро.
     """
     # Starlette 1.0+: request передаётся первым аргументом, не в context dict
     return templates.TemplateResponse(request, "index.html")

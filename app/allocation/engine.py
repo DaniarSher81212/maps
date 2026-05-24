@@ -60,6 +60,7 @@ from datetime import datetime
 from decimal import ROUND_DOWN, Decimal
 from typing import Optional
 
+from sqlalchemy import delete
 from sqlalchemy.orm import Session
 
 from app.core.logging_config import get_logger
@@ -1002,9 +1003,22 @@ class AllocationEngine:
         """
         Создать запись сессии распределения в БД.
 
-        Создаётся в самом начале со статусом "running".
+        Перед созданием удаляем все существующие сессии (и связанные данные).
+        Система работает в режиме «одна сессия»: старые результаты всегда
+        заменяются новыми. Порядок удаления важен из-за FK-зависимостей:
+        сначала дочерние таблицы, потом родительская.
+
+        Создаётся со статусом "running".
         При завершении обновляется на "completed" (или "failed").
         """
+        # Удаляем все данные предыдущего запуска (каскадно по FK-порядку)
+        self.session.execute(delete(StockMovement))
+        self.session.execute(delete(AllocationResult))
+        self.session.execute(delete(DeficitRecord))
+        self.session.execute(delete(AllocationSession))
+        self.session.flush()  # Применяем удаление перед вставкой новой сессии
+        logger.info("Предыдущие результаты распределения удалены.")
+
         alloc_session = AllocationSession(
             id=self.session_id,
             status="running",

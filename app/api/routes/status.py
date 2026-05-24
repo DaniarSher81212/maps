@@ -3,7 +3,7 @@ app/api/routes/status.py — Эндпоинт статуса системы
 
 GET /api/status — возвращает агрегированную статистику:
   - Количество активных работ, материалов, складских партий
-  - Информацию о последней сессии распределения
+  - Информацию о текущей (единственной) сессии распределения
 """
 
 from fastapi import APIRouter
@@ -18,9 +18,10 @@ router = APIRouter()
 @router.get("/status")
 def get_status() -> dict:
     """
-    Вернуть текущий статус системы: счётчики и последнюю сессию распределения.
+    Вернуть текущий статус системы: счётчики и текущую сессию распределения.
 
-    Используется дашбордом для отображения карточек статуса.
+    В системе всегда не более одной сессии (старая удаляется при новом запуске).
+    Используется дашбордом для отображения карточек статуса и текущих результатов.
     """
     with get_session() as session:
         # Количество активных работ (только status='active')
@@ -36,26 +37,26 @@ def get_status() -> dict:
             select(func.count(StockBatch.id)).where(StockBatch.dostupno > 0)
         ) or 0
 
-        # Последняя сессия распределения (самая свежая по времени начала)
-        last = session.scalar(
+        # Текущая сессия распределения (всегда одна — самая свежая)
+        current = session.scalar(
             select(AllocationSession).order_by(desc(AllocationSession.started_at))
         )
 
-        last_session = None
-        if last:
-            last_session = {
-                "id": last.id,
-                "status": last.status,
-                "started_at": last.started_at.isoformat() if last.started_at else None,
-                "completed_at": last.completed_at.isoformat() if last.completed_at else None,
-                "total_requirements": last.total_requirements,
-                "total_allocated": last.total_allocated,
-                "total_deficit": last.total_deficit,
+        current_session = None
+        if current:
+            current_session = {
+                "id": current.id,
+                "status": current.status,
+                "started_at": current.started_at.isoformat() if current.started_at else None,
+                "completed_at": current.completed_at.isoformat() if current.completed_at else None,
+                "total_requirements": current.total_requirements,
+                "total_allocated": current.total_allocated,
+                "total_deficit": current.total_deficit,
             }
 
         return {
             "active_works": active_works,
             "materials": materials,
             "available_batches": available_batches,
-            "last_session": last_session,
+            "current_session": current_session,
         }
