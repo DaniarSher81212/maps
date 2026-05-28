@@ -543,6 +543,63 @@ class StockMovement(Base):
         )
 
 
+class ApprovedTransfer(Base):
+    """
+    Таблица approved_transfers — согласованные межфилиальные перемещения.
+
+    Что это такое?
+        После первого распределения в отчёте появляется лист «Возможное перемещение»:
+        там показаны склады ДРУГИХ филиалов, материалы с которых МОГЛИ БЫ закрыть дефицит.
+        Руководитель анализирует этот лист и согласовывает конкретные перемещения.
+
+        Затем пользователь загружает Excel-файл с согласованными перемещениями в систему.
+        При следующем запуске распределения эти перемещения учитываются как реальный источник:
+        материал берётся с указанного склада и засчитывается в покрытие потребности.
+
+    Чем отличается от «Возможного перемещения»?
+        Возможное (is_possible=True) — только аналитика, остатки не меняются.
+        Одобренное (ApprovedTransfer) — реальное покрытие, остатки склада УМЕНЬШАЮТСЯ.
+
+    Поля:
+        material_id:        Какой материал переместить
+        from_warehouse_id:  С какого склада (source)
+        to_filial:          В какой филиал (destination)
+        kolichestvo:        Исходное разрешённое количество
+        dostupno:           Остаток доступного (уменьшается алгоритмом при каждом запуске)
+        uploaded_at:        Когда загружен файл согласования
+    """
+    __tablename__ = "approved_transfers"
+    __table_args__ = (
+        # Индекс по (материал, филиал-получатель) — ключевой запрос алгоритма Layer 3в
+        Index("ix_approved_transfers_material_filial", "material_id", "to_filial"),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+
+    # Что перемещаем
+    material_id: Mapped[int] = mapped_column(ForeignKey("materials.id"), nullable=False)
+    # С какого склада (другой филиал)
+    from_warehouse_id: Mapped[int] = mapped_column(ForeignKey("warehouses.id"), nullable=False)
+    # В какой филиал (тот, у которого был дефицит)
+    to_filial: Mapped[str] = mapped_column(String(100), nullable=False)
+
+    # Согласованное количество (не меняется)
+    kolichestvo: Mapped[Decimal] = mapped_column(Numeric(18, 4), default=0)
+    # Доступный остаток (сбрасывается в kolichestvo при каждом перезапуске алгоритма)
+    dostupno: Mapped[Decimal] = mapped_column(Numeric(18, 4), default=0)
+
+    uploaded_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
+
+    material: Mapped["Material"] = relationship()
+    from_warehouse: Mapped["Warehouse"] = relationship()
+
+    def __repr__(self) -> str:
+        return (
+            f"<ApprovedTransfer mat={self.material_id} "
+            f"wh={self.from_warehouse_id} → {self.to_filial!r} qty={self.kolichestvo}>"
+        )
+
+
 class DeficitRecord(Base):
     """
     Таблица deficit_records — записи о дефиците (Слой 5: К закупу).

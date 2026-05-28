@@ -67,6 +67,7 @@ from app.core.logging_config import get_logger
 from app.db.models import (
     AllocationResult,
     AllocationSession,
+    ApprovedTransfer,
     DeficitRecord,
     IssuedNotWrittenOff,
     Material,
@@ -78,6 +79,7 @@ from app.db.models import (
     WriteOff,
 )
 from app.repositories.material_repository import (
+    ApprovedTransferRepository,
     IssuedNotWrittenOffRepository,
     StockBatchRepository,
     SupplyRepository,
@@ -217,6 +219,7 @@ class AllocationEngine:
         self.supply_repo = SupplyRepository(session)
         self.writeoff_repo = WriteOffRepository(session)
         self.issued_repo = IssuedNotWrittenOffRepository(session)
+        self.approved_repo = ApprovedTransferRepository(session)
 
         # Буферы для batch-INSERT в конце (намного быстрее, чем INSERT на каждую строку).
         # Мы накапливаем объекты в памяти, затем одной командой сохраняем всё в БД.
@@ -239,12 +242,22 @@ class AllocationEngine:
         self._writeoff_cache: dict[tuple[int, int], list[WriteOff]] = {}
         self._issued_cache: dict[tuple[int, int], list[IssuedNotWrittenOff]] = {}
 
+        # Предзагруженные данные Слоя 3в: согласованные перемещения.
+        # Ключ: (material_id, to_filial). Значение: список ApprovedTransfer.
+        # Загружается один раз в run(). Если таблица пустая — словарь пустой,
+        # и метод _allocate_from_approved_transfers просто ничего не делает.
+        self._approved_cache: dict[tuple[int, str], list[ApprovedTransfer]] = {}
+        # Актуальное доступное количество по каждому согласованному перемещению.
+        # {approved_transfer_id: dostupno} — обновляется в памяти, пишется в БД в конце.
+        self._approved_qty_cache: dict[int, Decimal] = {}
+
         # Статистика для вывода после завершения
         self._stats = {
             "requirements_processed": 0,  # Всего обработано потребностей
             "allocated_writeoff": 0,       # Строк из слоя 1 (списание)
             "allocated_issued": 0,         # Строк из слоя 2 (выдано не списано)
-            "allocated_warehouse": 0,      # Строк из слоя 3 (склад)
+            "allocated_warehouse": 0,      # Строк из слоя 3 (склад своего филиала)
+            "allocated_approved": 0,       # Строк из слоя 3в (согласованные перемещения)
             "possible_warehouse": 0,       # Строк «возможного» (другие филиалы)
             "allocated_supply": 0,         # Строк из слоя 4 (поставки)
             "deficit_records": 0,          # Строк дефицита (к закупу)
@@ -287,6 +300,16 @@ class AllocationEngine:
             logger.info("Загрузка данных слоя 2 (выдано не списано)...")
             self._issued_cache = self.issued_repo.get_all_grouped_by_work_material()
 
+            logger.info("Загрузка данных слоя 3в (согласованные перемещения)...")
+            self._approved_cache = self.approved_repo.get_grouped_by_material_filial()
+            if self._approved_cache:
+                logger.info(
+                    "Согласованные перемещения активны: %d пар материал+филиал",
+                    len(self._approved_cache),
+                )
+            else:
+                logger.info("Согласованных перемещений нет — Layer 3в пропускается.")
+
             # Шаг 3: Сбрасываем результаты предыдущего запуска.
             # reset_allocation обнуляет raspredeleno/deficit у потребностей.
             # reset_dostupno восстанавливает dostupno=kolichestvo у партий и поставок,
@@ -294,6 +317,9 @@ class AllocationEngine:
             self.req_repo.reset_allocation()
             self.batch_repo.reset_dostupno()
             self.supply_repo.reset_dostupno()
+            # Сбрасываем dostupno согласованных перемещений (если они есть)
+            if self._approved_cache:
+                self.approved_repo.reset_dostupno()
 
             # Шаг 4: Получаем все потребности, отсортированные по приоритету
             requirements = self.req_repo.get_for_allocation()
@@ -394,9 +420,17 @@ class AllocationEngine:
         if remaining >= EPSILON:
             remaining = self._allocate_from_warehouse(req, work, material, remaining)
 
+        # ── СЛОЙ 3в: Согласованные межфилиальные перемещения ──
+        # Материал берётся с конкретных складов других филиалов,
+        # которые руководство разрешило использовать для данного филиала.
+        # Остатки складов-источников УМЕНЬШАЮТСЯ (в отличие от Слоя 3б).
+        if remaining >= EPSILON and self._approved_cache:
+            remaining = self._allocate_from_approved_transfers(req, work, material, remaining)
+
         # ── СЛОЙ 3б: Возможное движение из других филиалов ──
-        # Показываем возможный резерв, НО не уменьшаем remaining и не меняем остатки.
-        # Выполняем ВСЕГДА (не только при remaining > 0) — для полноты картины в отчёте.
+        # Показываем оставшийся возможный резерв (уже за вычетом согласованных).
+        # НЕ уменьшаем remaining и не меняем остатки — только для отчёта.
+        # Выполняем ВСЕГДА — для полноты картины в отчёте.
         self._record_possible_from_other_filial(req, work, material, remaining)
 
         # ── СЛОЙ 4: Поставки своего филиала ──
@@ -695,6 +729,161 @@ class AllocationEngine:
                 ))
 
         return remaining
+
+    # =========================================================================
+    # Слой 3в: Согласованные межфилиальные перемещения (реальное покрытие)
+    # =========================================================================
+
+    def _allocate_from_approved_transfers(
+        self,
+        req: Requirement,
+        work: Work,
+        material: Material,
+        remaining: Decimal,
+    ) -> Decimal:
+        """
+        Обработать Слой 3в: распределить из согласованных межфилиальных перемещений.
+
+        Что это значит?
+            Руководство разрешило взять конкретное количество материала M
+            со склада другого филиала (склад W) для покрытия работ в филиале F.
+            Это решение зафиксировано в таблице approved_transfers.
+
+            В отличие от «Возможного перемещения» (Слой 3б):
+              • Остатки склада-источника УМЕНЬШАЮТСЯ (как в обычном складском Слое 3)
+              • remaining уменьшается (потребность фактически закрывается)
+              • istochnik = "odobren_perenos" (отдельная категория в отчёте)
+
+        Алгоритм внутри слоя:
+            1. Ищем в _approved_cache записи для (material.id, work.filial)
+            2. Для каждого согласованного перемещения:
+               a. Берём партии склада-источника в порядке FIFO
+               b. Списываем не больше min(approved.dostupno, remaining)
+               c. Обновляем _batch_cache и _approved_qty_cache
+               d. Создаём StockMovement (детальное движение по партиям)
+               e. Создаём AllocationResult с istochnik="odobren_perenos"
+
+        Args:
+            req, work, material: потребность, работа, материал
+            remaining: сколько ещё не покрыто
+
+        Returns:
+            Обновлённый remaining после согласованных перемещений
+        """
+        key = (material.id, work.filial or "")
+        transfers = self._approved_cache.get(key, [])
+        if not transfers:
+            return remaining  # Нет согласованных перемещений для этой пары
+
+        for transfer in transfers:
+            if remaining < EPSILON:
+                break
+
+            # Актуальное доступное количество из этого согласования
+            approved_available = self._get_approved_available(transfer)
+            if approved_available < EPSILON:
+                continue  # Это согласование уже исчерпано
+
+            # Сколько максимум можем взять из этого согласования
+            take_limit = min(remaining, approved_available)
+
+            # Берём партии со склада-источника (FIFO)
+            batches = self.batch_repo.get_batches_for_warehouse_material(
+                warehouse_id=transfer.from_warehouse_id,
+                material_id=material.id,
+            )
+
+            # Накопитель для создания одной агрегированной строки результата
+            accumulators: dict[int, _WarehouseAccumulator] = {}
+            actual_taken = Decimal("0")  # Реально взяли (может быть меньше take_limit)
+
+            for batch in batches:
+                if take_limit - actual_taken < EPSILON:
+                    break
+
+                batch_available = self._get_batch_available(batch)
+                if batch_available < EPSILON:
+                    continue
+
+                qty = min(
+                    take_limit - actual_taken,
+                    batch_available,
+                ).quantize(Decimal("0.0001"), rounding=ROUND_DOWN)
+                if qty < EPSILON:
+                    continue
+
+                cost = batch.stoimost_za_ed or Decimal("0")
+
+                # Обновляем кэш остатков (в БД запишем в конце)
+                self._batch_cache[batch.id] = batch_available - qty
+
+                # Детальное движение по партии
+                self._movement_buffer.append(StockMovement(
+                    session_id=self.session_id,
+                    warehouse_id=batch.warehouse_id,
+                    material_id=material.id,
+                    batch_id=batch.id,
+                    work_id=work.id,
+                    izmenenie=-qty,
+                    ostatok=batch_available - qty,
+                ))
+
+                # Накапливаем для создания строки результата
+                wh_id = batch.warehouse_id
+                if wh_id not in accumulators:
+                    accumulators[wh_id] = _WarehouseAccumulator(
+                        warehouse_id=wh_id,
+                        is_possible=False,
+                        tip="odobren",  # Признак: согласованное межфилиальное
+                    )
+                accumulators[wh_id].add(qty, cost)
+                actual_taken += qty
+
+            if actual_taken < EPSILON:
+                continue  # Ничего не взяли (партии пустые) — идём к следующему согласованию
+
+            # Обновляем кэш согласованного перемещения
+            self._approved_qty_cache[transfer.id] = approved_available - actual_taken
+
+            # Создаём агрегированные строки результата: ОДНА на каждый склад
+            for acc in accumulators.values():
+                if acc.total_qty < EPSILON:
+                    continue
+                self._allocation_buffer.append(AllocationResult(
+                    session_id=self.session_id,
+                    requirement_id=req.id,
+                    work_id=work.id,
+                    material_id=material.id,
+                    istochnik="odobren_perenos",   # Согласованное межфилиальное перемещение
+                    warehouse_id=acc.warehouse_id,
+                    supply_line_id=None,
+                    kolichestvo=acc.total_qty,
+                    srednyaya_stoimost=acc.avg_cost,
+                    summa=acc.total_sum,
+                    tip_raspredeleniya="odobren",  # Для отчёта: отличаем от "zavod"/"filial"
+                    is_possible=False,             # Это фактическое распределение, не анализ
+                ))
+
+            req.raspredeleno += actual_taken
+            remaining -= actual_taken
+            self._stats["allocated_approved"] += 1
+
+            logger.debug(
+                "  [одобрено] склад=%d → филиал=%s | qty=%.4f",
+                transfer.from_warehouse_id, work.filial, actual_taken,
+            )
+
+        return remaining
+
+    def _get_approved_available(self, transfer: ApprovedTransfer) -> Decimal:
+        """
+        Получить актуальное доступное количество согласованного перемещения.
+
+        Работает через кэш — аналогично _get_batch_available.
+        """
+        if transfer.id not in self._approved_qty_cache:
+            self._approved_qty_cache[transfer.id] = transfer.dostupno
+        return self._approved_qty_cache[transfer.id]
 
     # =========================================================================
     # Слой 3б: Возможное движение из других филиалов (только анализ)
@@ -1016,12 +1205,18 @@ class AllocationEngine:
             if line is not None:
                 line.dostupno = new_available
 
+        # Обновляем остатки согласованных перемещений (из _approved_qty_cache)
+        for transfer_id, new_available in self._approved_qty_cache.items():
+            transfer = self.session.get(ApprovedTransfer, transfer_id)
+            if transfer is not None:
+                transfer.dostupno = new_available
+
         # Сохраняем все UPDATE в PostgreSQL
         self.session.flush()
 
         logger.info(
-            "Обновлено партий: %d, строк поставок: %d",
-            len(self._batch_cache), len(self._supply_cache),
+            "Обновлено партий: %d, строк поставок: %d, согласованных перемещений: %d",
+            len(self._batch_cache), len(self._supply_cache), len(self._approved_qty_cache),
         )
 
     def _create_session_record(self) -> AllocationSession:

@@ -1,45 +1,56 @@
 """
 app/services/export_service.py — Экспорт результатов распределения в Excel
 
-Структура Excel-отчёта (4 листа):
+Структура Excel-отчёта (до 11 листов):
 ──────────────────────────────────────────────────────────────────────────────
+
+  Результаты распределения:
 
   Лист 1: «Распределение» (главная широкая таблица)
       Одна строка = одна потребность (работа + материал).
       Все слои покрытия — в виде групп колонок:
-
-      ┌─────────────────────────────────────────────────────────────────────┐
-      │ РАБОТА | МАТЕРИАЛ | ПОТРЕБНОСТЬ | Сп-е | Выд-но | Склад | Пост-ки │ К закупу │ %  │
-      └─────────────────────────────────────────────────────────────────────┘
-
-      Группы колонок:
         • Работа: код, филиал, завод, дата начала/конца, приоритет, аварийная
         • Материал: системный номер, наименование, ед.изм
         • Потребность: количество, прогнозная цена, прогнозная стоимость
-        • Слой 1 «Списание»: кол-во, цена, сумма
-        • Слой 2 «Выдано не списано»: кол-во, цена, сумма
+        • Слой 1 «Сп-е»: кол-во, цена, сумма
+        • Слой 2 «Выд-но»: кол-во, цена, сумма
         • Слой 3 «Склад»: кол-во, средняя цена, сумма
+        • Слой 3в «Од-е» (Одобренные перемещения): кол-во, средняя цена, сумма
         • Слой 4 «Поставки»: договор(а), поставщик(и), кол-во, цена, сумма
         • «К закупу»: кол-во, прогнозная цена, сумма
         • «Обеспечённость %»: (покрытая стоимость / прогнозная стоимость) × 100
 
-      Формула обеспечённости (ПО СТОИМОСТИ, не по количеству):
-        covered_cost = сумма_списание + сумма_выдано + сумма_склад + сумма_поставки
-        total_cost   = potrebnost × prognosnaya_tsena
-        coverage_pct = covered_cost / total_cost × 100
-
   Лист 2: «Движение склада»
       Детальное движение: склад → партия → работа → материал → количество → остаток.
-      Одна строка = одна партия, списанная на одну работу.
 
-  Лист 3: «Остатки складов»
+  Лист 3: «Остатки складов после распределения»
       Текущие остатки после распределения.
       Показывает: начальный остаток → распределено → остаток.
 
   Лист 4: «Возможное перемещение»
       Склады других филиалов, которые МОГЛИ БЫ покрыть дефицит.
       Только для анализа — фактически не распределены.
-      Показывает откуда и сколько можно перебросить при согласовании.
+
+  Лист 5: «Одобренные перемещения» (условный — только если загружены)
+      Перемещения, которые были реально распределены через Слой 3в.
+
+  Лист 6: «Обеспеченность»
+      Сводка по работам: сколько покрыто, сколько в дефиците, % обеспечённости.
+
+  Лист 7: «В пути»
+      Поставки, которые распределены на конкретные работы и ожидают прихода.
+
+  Лист 8: «Не распред. в пути»
+      Поставки, из которых остался нераспределённый остаток.
+
+  Исходные данные (для аудита и сверки):
+
+  Лист 9:  «Исх: Потребности»      — все потребности до распределения
+  Лист 10: «Исх: Остатки складов»  — начальные остатки до распределения
+  Лист 11: «Исх: Поставки»         — все строки поставок, загруженные в систему
+
+  Числа: разделитель дробной части — запятая (формат «1234,56»)
+  Даты:  формат ДД.ММ.ГГГГ
 """
 
 from datetime import datetime
@@ -54,6 +65,65 @@ from app.core.logging_config import get_logger
 from app.db.database import get_session
 
 logger = get_logger(__name__)
+
+
+# =============================================================================
+# Вспомогательные функции форматирования
+# =============================================================================
+
+def _fmt_num(val: object, decimals: int = 2) -> str:
+    """
+    Форматировать число с запятой как разделителем дробной части (русский формат).
+
+    Примеры:
+        _fmt_num(1234.56)        → "1234,56"
+        _fmt_num(1234.5678, 4)   → "1234,5678"
+        _fmt_num(None)           → ""
+        _fmt_num(float('nan'))   → ""
+
+    Зачем строка, а не число?
+        Excel-файл открывается у пользователей с русской локалью.
+        Записывая строку с запятой, мы гарантируем корректный вид независимо от
+        настроек системы. Это принятая практика для отчётных файлов.
+    """
+    if val is None:
+        return ""
+    try:
+        f = float(val)  # type: ignore[arg-type]
+        if pd.isna(f):
+            return ""
+        return f"{f:.{decimals}f}".replace(".", ",")
+    except (ValueError, TypeError):
+        return ""
+
+
+def _fmt_date(val: object) -> str:
+    """
+    Форматировать дату в формате ДД.ММ.ГГГГ.
+
+    Принимает: date, datetime, pandas Timestamp, строку.
+    Возвращает строку "28.05.2026" или "" если пусто.
+    """
+    if val is None:
+        return ""
+    try:
+        if pd.isna(val):  # type: ignore[arg-type]
+            return ""
+    except (TypeError, ValueError):
+        pass
+    if hasattr(val, "strftime"):
+        return val.strftime("%d.%m.%Y")  # type: ignore[union-attr]
+    s = str(val).strip()
+    if not s or s in ("None", "NaT", "nan"):
+        return ""
+    # Попытка разобрать ISO-дату → DD.MM.YYYY
+    for fmt in ("%Y-%m-%d", "%d.%m.%Y"):
+        try:
+            from datetime import datetime as dt
+            return dt.strptime(s, fmt).strftime("%d.%m.%Y")
+        except ValueError:
+            continue
+    return s  # Возвращаем как есть если не смогли разобрать
 
 
 def export_allocation_results(
@@ -87,23 +157,39 @@ def export_allocation_results(
 
     # Запрашиваем данные из БД (одна открытая сессия для всех запросов)
     with get_session() as session:
+        # ── Результаты распределения (7 основных листов) ──
         df_main         = _get_wide_allocation_df(session, session_id)
         df_movement     = _get_movement_df(session, session_id)
         df_balances     = _get_warehouse_balances_df(session, session_id)
         df_possible     = _get_possible_movements_df(session, session_id)
+        df_approved     = _get_approved_transfers_df(session, session_id)
         df_coverage     = _get_coverage_by_work_df(session, session_id)
         df_transit      = _get_in_transit_allocated_df(session, session_id)
         df_transit_free = _get_in_transit_unallocated_df(session, session_id)
 
-    # Записываем в Excel (7 листов)
+        # ── Исходные данные (3 дополнительных листа) ──
+        df_src_req      = _get_source_requirements_df(session)
+        df_src_stock    = _get_source_stock_df(session)
+        df_src_supplies = _get_source_supplies_df(session)
+
+    # Записываем в Excel
     with pd.ExcelWriter(file_path, engine="openpyxl") as writer:
+        # Результаты распределения
         _write_sheet(writer, df_main,         "Распределение")
         _write_sheet(writer, df_movement,     "Движение склада")
-        _write_sheet(writer, df_balances,     "Остатки складов")
+        _write_sheet(writer, df_balances,     "Остатки складов после распределения")
         _write_sheet(writer, df_possible,     "Возможное перемещение")
+        # Лист согласованных перемещений — только если они были загружены
+        if not df_approved.empty:
+            _write_sheet(writer, df_approved, "Одобренные перемещения")
         _write_sheet(writer, df_coverage,     "Обеспеченность")
         _write_sheet(writer, df_transit,      "В пути")
         _write_sheet(writer, df_transit_free, "Не распред. в пути")
+
+        # Исходные данные
+        _write_sheet(writer, df_src_req,      "Исх: Потребности")
+        _write_sheet(writer, df_src_stock,    "Исх: Остатки складов")
+        _write_sheet(writer, df_src_supplies, "Исх: Поставки")
 
     logger.info(
         "Отчёт создан: %s | строк в главной таблице: %d",
@@ -227,8 +313,10 @@ def _get_wide_allocation_df(session, session_id: str) -> pd.DataFrame:
     df_sp = _agg_layer("spisanie")
     # Слой 2: Выдано не списано
     df_vd = _agg_layer("vydano")
-    # Слой 3: Склад
+    # Слой 3: Склад (только свой завод/филиал)
     df_sk = _agg_layer("sklad")
+    # Слой 3в: Одобренное межфилиальное перемещение
+    df_od = _agg_layer("odobren_perenos")
 
     # Слой 4: Поставки — особая агрегация (нужны договора и поставщики)
     df_pv_raw = df_alloc[df_alloc["istochnik"] == "postavka"].copy()
@@ -288,7 +376,8 @@ def _get_wide_allocation_df(session, session_id: str) -> pd.DataFrame:
 
     df = _merge_layer(df, df_sp, "sp")   # Слой 1: Списание
     df = _merge_layer(df, df_vd, "vd")   # Слой 2: Выдано
-    df = _merge_layer(df, df_sk, "sk")   # Слой 3: Склад
+    df = _merge_layer(df, df_sk, "sk")   # Слой 3: Склад (свой завод/филиал)
+    df = _merge_layer(df, df_od, "od")   # Слой 3в: Одобренное перемещение
 
     # Слой 4: Поставки — дополнительные колонки для договора и поставщика
     if not df_pv.empty:
@@ -314,8 +403,11 @@ def _get_wide_allocation_df(session, session_id: str) -> pd.DataFrame:
         df["postavshchiki"] = ""
 
     # ── Шаг 5: Считаем обеспечённость ПО СТОИМОСТИ ──
-    # Суммарная покрытая стоимость = сумма по всем слоям 1-4
-    df["covered_summa"] = df["sp_summa"] + df["vd_summa"] + df["sk_summa"] + df["pv_summa"]
+    # Суммарная покрытая стоимость = сумма по всем слоям 1-4 + 3в (одобренные)
+    df["covered_summa"] = (
+        df["sp_summa"] + df["vd_summa"] + df["sk_summa"]
+        + df["od_summa"] + df["pv_summa"]
+    )
 
     # К закупу: количество = дефицит, стоимость = дефицит × прогнозная цена
     df["zakup_qty"] = df["deficit"].astype(float)
@@ -338,6 +430,8 @@ def _get_wide_allocation_df(session, session_id: str) -> pd.DataFrame:
     )
 
     # ── Шаг 6: Формируем итоговую таблицу с понятными заголовками ──
+    # Числа форматируем с запятой как разделителем дробной части (русский формат).
+    # Даты — в формате ДД.ММ.ГГГГ.
     result = pd.DataFrame({
         # Признак аварийности
         "Аварийная": df["is_emergency"].apply(lambda x: "Да" if x else ""),
@@ -347,8 +441,8 @@ def _get_wide_allocation_df(session, session_id: str) -> pd.DataFrame:
         "Код работы":       df["kod_raboty"],
         "Филиал":           df["filial_raboty"],
         "Завод":            df["zavod_raboty"],
-        "Дата начала":      df["data_nachala"],
-        "Дата окончания":   df["data_okonchaniya"],
+        "Дата начала":      df["data_nachala"].apply(_fmt_date),
+        "Дата окончания":   df["data_okonchaniya"].apply(_fmt_date),
 
         # Данные материала
         "Системный номер":  df["sys_nomer"],
@@ -356,39 +450,44 @@ def _get_wide_allocation_df(session, session_id: str) -> pd.DataFrame:
         "Ед.изм":           df["ed_izm"],
 
         # Потребность
-        "Потребность":          df["potrebnost"].astype(float).round(4),
-        "Прогнозная цена":      df["prognosnaya_tsena"].astype(float).round(2),
-        "Прогнозная стоимость": df["prognosnaya_stoimost"].round(2),
+        "Потребность":          df["potrebnost"].apply(lambda v: _fmt_num(v, 4)),
+        "Прогнозная цена":      df["prognosnaya_tsena"].apply(lambda v: _fmt_num(v, 2)),
+        "Прогнозная стоимость": df["prognosnaya_stoimost"].apply(lambda v: _fmt_num(v, 2)),
 
         # Слой 1: Списание
-        "Сп: Кол-во":       df["sp_qty"].round(4),
-        "Сп: Цена":         df["sp_price"].round(2),
-        "Сп: Сумма":        df["sp_summa"].round(2),
+        "Сп: Кол-во":       df["sp_qty"].apply(lambda v: _fmt_num(v, 4)),
+        "Сп: Цена":         df["sp_price"].apply(lambda v: _fmt_num(v, 2)),
+        "Сп: Сумма":        df["sp_summa"].apply(lambda v: _fmt_num(v, 2)),
 
         # Слой 2: Выдано не списано
-        "Вд: Кол-во":       df["vd_qty"].round(4),
-        "Вд: Цена":         df["vd_price"].round(2),
-        "Вд: Сумма":        df["vd_summa"].round(2),
+        "Вд: Кол-во":       df["vd_qty"].apply(lambda v: _fmt_num(v, 4)),
+        "Вд: Цена":         df["vd_price"].apply(lambda v: _fmt_num(v, 2)),
+        "Вд: Сумма":        df["vd_summa"].apply(lambda v: _fmt_num(v, 2)),
 
-        # Слой 3: Склад
-        "Сл: Кол-во":       df["sk_qty"].round(4),
-        "Сл: Ср.цена":      df["sk_price"].round(2),
-        "Сл: Сумма":        df["sk_summa"].round(2),
+        # Слой 3: Склад своего завода/филиала
+        "Сл: Кол-во":       df["sk_qty"].apply(lambda v: _fmt_num(v, 4)),
+        "Сл: Ср.цена":      df["sk_price"].apply(lambda v: _fmt_num(v, 2)),
+        "Сл: Сумма":        df["sk_summa"].apply(lambda v: _fmt_num(v, 2)),
+
+        # Слой 3в: Одобренные межфилиальные перемещения
+        "Од: Кол-во":       df["od_qty"].apply(lambda v: _fmt_num(v, 4)),
+        "Од: Ср.цена":      df["od_price"].apply(lambda v: _fmt_num(v, 2)),
+        "Од: Сумма":        df["od_summa"].apply(lambda v: _fmt_num(v, 2)),
 
         # Слой 4: Поставки
         "Пс: Договор(а)":   df["dogovora"],
         "Пс: Поставщик(и)": df["postavshchiki"],
-        "Пс: Кол-во":       df["pv_qty"].round(4),
-        "Пс: Ср.цена":      df["pv_price"].round(2),
-        "Пс: Сумма":        df["pv_summa"].round(2),
+        "Пс: Кол-во":       df["pv_qty"].apply(lambda v: _fmt_num(v, 4)),
+        "Пс: Ср.цена":      df["pv_price"].apply(lambda v: _fmt_num(v, 2)),
+        "Пс: Сумма":        df["pv_summa"].apply(lambda v: _fmt_num(v, 2)),
 
         # К закупу
-        "Закуп: Кол-во":    df["zakup_qty"].round(4),
-        "Закуп: Цена":      df["zakup_price"].round(2),
-        "Закуп: Сумма":     df["zakup_summa"].round(2),
+        "Закуп: Кол-во":    df["zakup_qty"].apply(lambda v: _fmt_num(v, 4)),
+        "Закуп: Цена":      df["zakup_price"].apply(lambda v: _fmt_num(v, 2)),
+        "Закуп: Сумма":     df["zakup_summa"].apply(lambda v: _fmt_num(v, 2)),
 
         # Итоговый показатель
-        "Обеспечённость %": df["coverage_pct"],
+        "Обеспечённость %": df["coverage_pct"].apply(lambda v: _fmt_num(v, 1)),
     })
 
     return result
@@ -445,7 +544,18 @@ def _get_movement_df(session, session_id: str) -> pd.DataFrame:
             sm.id
     """)
     rows = session.execute(sql, {"sid": session_id}).fetchall()
-    return _to_df(rows)
+    df = _to_df(rows)
+    if df.empty:
+        return df
+    # Форматируем даты и числа
+    for col in ["Дата поступления партии", "Дата движения"]:
+        if col in df.columns:
+            df[col] = df[col].apply(_fmt_date)
+    for col in ["Нач. кол-во партии", "Цена за ед.", "Списано", "Остаток партии после"]:
+        if col in df.columns:
+            decimals = 4 if "кол-во" in col.lower() or "списано" in col.lower() or "остаток" in col.lower() else 2
+            df[col] = df[col].apply(lambda v, d=decimals: _fmt_num(v, d))
+    return df
 
 
 # =============================================================================
@@ -490,7 +600,18 @@ def _get_warehouse_balances_df(session, _session_id: str = "") -> pd.DataFrame:
     """)
     # Остатки глобальные (не привязаны к сессии) — они уже обновлены алгоритмом
     rows = session.execute(sql).fetchall()
-    return _to_df(rows)
+    df = _to_df(rows)
+    if df.empty:
+        return df
+    if "Дата поступления" in df.columns:
+        df["Дата поступления"] = df["Дата поступления"].apply(_fmt_date)
+    for col in ["Нач. остаток", "Распределено", "Текущий остаток"]:
+        if col in df.columns:
+            df[col] = df[col].apply(lambda v: _fmt_num(v, 4))
+    for col in ["Цена за ед.", "Сумма остатка"]:
+        if col in df.columns:
+            df[col] = df[col].apply(lambda v: _fmt_num(v, 2))
+    return df
 
 
 # =============================================================================
@@ -546,7 +667,77 @@ def _get_possible_movements_df(session, session_id: str) -> pd.DataFrame:
             m.sys_nomer
     """)
     rows = session.execute(sql, {"sid": session_id}).fetchall()
-    return _to_df(rows)
+    df = _to_df(rows)
+    if df.empty:
+        return df
+    for col in ["Дата начала", "Нужно к дате"]:
+        if col in df.columns:
+            df[col] = df[col].apply(_fmt_date)
+    for col in ["Возможное кол-во"]:
+        if col in df.columns:
+            df[col] = df[col].apply(lambda v: _fmt_num(v, 4))
+    for col in ["Средняя цена", "Оценочная сумма"]:
+        if col in df.columns:
+            df[col] = df[col].apply(lambda v: _fmt_num(v, 2))
+    return df
+
+
+# =============================================================================
+# Лист «Одобренные перемещения» (результат Layer 3в)
+# =============================================================================
+
+def _get_approved_transfers_df(session, session_id: str) -> pd.DataFrame:
+    """
+    Список согласованных перемещений, которые были использованы в распределении.
+
+    Показывает: что именно было взято с чужих складов по одобренным переброскам.
+    Если таблица approved_transfers пуста (пользователь не загружал файл) — лист не создаётся.
+    """
+    sql = text("""
+        SELECT
+            w.prioritet                                  AS "Приоритет",
+            w.is_emergency                               AS "Аварийная",
+            w.kod_raboty                                 AS "Код работы",
+            w.filial                                     AS "Филиал работы",
+            w.zavod                                      AS "Завод работы",
+            w.data_nachala                               AS "Дата начала",
+            w.data_okonchaniya                           AS "Нужно к дате",
+            m.sys_nomer                                  AS "Системный номер",
+            m.naimenovanie                               AS "Наименование материала",
+            m.ed_izm                                     AS "Ед.изм",
+            wh.kod_sklada                                AS "Склад-источник",
+            wh.filial                                    AS "Филиал склада",
+            wh.zavod                                     AS "Завод склада",
+            CAST(ar.kolichestvo AS NUMERIC(18,4))        AS "Взято кол-во",
+            CAST(ar.srednyaya_stoimost AS NUMERIC(18,2)) AS "Средняя цена",
+            CAST(ar.summa AS NUMERIC(18,2))              AS "Сумма",
+            'Одобрено руководством'                      AS "Статус"
+        FROM allocation_results ar
+        JOIN works     w  ON ar.work_id     = w.id
+        JOIN materials m  ON ar.material_id = m.id
+        LEFT JOIN warehouses wh ON ar.warehouse_id = wh.id
+        WHERE ar.session_id = :sid
+          AND ar.istochnik  = 'odobren_perenos'
+        ORDER BY
+            w.is_emergency DESC,
+            w.data_nachala ASC NULLS LAST,
+            w.kod_raboty,
+            m.sys_nomer
+    """)
+    rows = session.execute(sql, {"sid": session_id}).fetchall()
+    df = _to_df(rows)
+    if df.empty:
+        return df
+    for col in ["Дата начала", "Нужно к дате"]:
+        if col in df.columns:
+            df[col] = df[col].apply(_fmt_date)
+    for col in ["Взято кол-во"]:
+        if col in df.columns:
+            df[col] = df[col].apply(lambda v: _fmt_num(v, 4))
+    for col in ["Средняя цена", "Сумма"]:
+        if col in df.columns:
+            df[col] = df[col].apply(lambda v: _fmt_num(v, 2))
+    return df
 
 
 # =============================================================================
@@ -648,19 +839,17 @@ def _get_coverage_by_work_df(session, session_id: str) -> pd.DataFrame:
     # --- Формируем итоговую таблицу с русскими заголовками ---
     result = pd.DataFrame({
         "Код работы":           df["kod_raboty"],
-        # nazvanie может быть None → заменяем на пустую строку для читаемости
         "Наименование работы":  df["nazvanie"].fillna(""),
         "Филиал":               df["filial"].fillna(""),
         "Завод":                df["zavod"].fillna(""),
-        "Дата начала":          df["data_nachala"],
-        "Дата окончания":       df["data_okonchaniya"],
-        # Булевое поле → "Да"/"Нет" для удобства чтения в Excel
+        "Дата начала":          df["data_nachala"].apply(_fmt_date),
+        "Дата окончания":       df["data_okonchaniya"].apply(_fmt_date),
         "Аварийная":            df["is_emergency"].apply(lambda x: "Да" if x else "Нет"),
         "Материалов":           df["materials_count"].astype(int),
-        "Стоимость потребности":  df["stoimost_potrebnosti"].round(2),
-        "Стоимость обеспечено":   df["stoimost_obespecheno"].round(2),
-        "Стоимость дефицита":     df["stoimost_deficita"].round(2),
-        "Обеспеченность %":       df["coverage_pct"],
+        "Стоимость потребности": df["stoimost_potrebnosti"].apply(lambda v: _fmt_num(v, 2)),
+        "Стоимость обеспечено":  df["stoimost_obespecheno"].apply(lambda v: _fmt_num(v, 2)),
+        "Стоимость дефицита":    df["stoimost_deficita"].apply(lambda v: _fmt_num(v, 2)),
+        "Обеспеченность %":      df["coverage_pct"].apply(lambda v: _fmt_num(v, 1)),
     })
 
     return result
@@ -712,7 +901,15 @@ def _get_in_transit_allocated_df(session, session_id: str) -> pd.DataFrame:
             "Код работы", "Наименование работы", "Системный номер", "Наименование материала",
             "Ед.изм", "Кол-во распределено", "Стоимость за ед", "Сумма",
         ])
-    return pd.DataFrame(rows, columns=list(rows[0]._fields))
+    df = pd.DataFrame(rows, columns=list(rows[0]._fields))
+    if "Дата поставки" in df.columns:
+        df["Дата поставки"] = df["Дата поставки"].apply(_fmt_date)
+    if "Кол-во распределено" in df.columns:
+        df["Кол-во распределено"] = df["Кол-во распределено"].apply(lambda v: _fmt_num(v, 4))
+    for col in ["Стоимость за ед", "Сумма"]:
+        if col in df.columns:
+            df[col] = df[col].apply(lambda v: _fmt_num(v, 2))
+    return df
 
 
 # =============================================================================
@@ -758,7 +955,151 @@ def _get_in_transit_unallocated_df(session, _session_id: str = "") -> pd.DataFra
             "Системный номер", "Наименование материала", "Ед.изм",
             "Кол-во всего", "Распределено", "Остаток", "Стоимость за ед", "Сумма остатка",
         ])
-    return pd.DataFrame(rows, columns=list(rows[0]._fields))
+    df = pd.DataFrame(rows, columns=list(rows[0]._fields))
+    if "Дата поставки" in df.columns:
+        df["Дата поставки"] = df["Дата поставки"].apply(_fmt_date)
+    for col in ["Кол-во всего", "Распределено", "Остаток"]:
+        if col in df.columns:
+            df[col] = df[col].apply(lambda v: _fmt_num(v, 4))
+    for col in ["Стоимость за ед", "Сумма остатка"]:
+        if col in df.columns:
+            df[col] = df[col].apply(lambda v: _fmt_num(v, 2))
+    return df
+
+
+# =============================================================================
+# Листы с исходными данными (для сверки и аудита)
+# =============================================================================
+
+def _get_source_requirements_df(session) -> pd.DataFrame:
+    """
+    Лист «Исх: Потребности» — все потребности до распределения.
+
+    Зачем нужен этот лист?
+        Позволяет сверить, что именно было загружено в систему:
+        какие работы, какие материалы, какое количество.
+        Помогает при аудите: «откуда взялась эта потребность?»
+    """
+    sql = text("""
+        SELECT
+            w.is_emergency                               AS "Аварийная",
+            w.prioritet                                  AS "Приоритет",
+            w.kod_raboty                                 AS "Код работы",
+            COALESCE(w.nazvanie, '')                     AS "Наименование работы",
+            w.filial                                     AS "Филиал",
+            w.zavod                                      AS "Завод",
+            w.data_nachala                               AS "Дата начала",
+            w.data_okonchaniya                           AS "Дата окончания",
+            w.status                                     AS "Статус работы",
+            m.sys_nomer                                  AS "Системный номер",
+            m.naimenovanie                               AS "Наименование материала",
+            m.ed_izm                                     AS "Ед.изм",
+            CAST(r.potrebnost AS NUMERIC(18,4))          AS "Потребность",
+            CAST(r.prognosnaya_tsena AS NUMERIC(18,2))   AS "Прогнозная цена",
+            CAST(r.potrebnost * r.prognosnaya_tsena AS NUMERIC(18,2)) AS "Прогнозная стоимость"
+        FROM requirements r
+        JOIN works     w ON r.work_id     = w.id
+        JOIN materials m ON r.material_id = m.id
+        ORDER BY
+            w.is_emergency DESC,
+            w.data_nachala ASC NULLS LAST,
+            w.prioritet ASC,
+            w.kod_raboty,
+            m.sys_nomer
+    """)
+    rows = session.execute(sql).fetchall()
+    df = _to_df(rows)
+    if df.empty:
+        return df
+    df["Аварийная"] = df["Аварийная"].apply(lambda x: "Да" if x else "")
+    for col in ["Дата начала", "Дата окончания"]:
+        if col in df.columns:
+            df[col] = df[col].apply(_fmt_date)
+    df["Потребность"] = df["Потребность"].apply(lambda v: _fmt_num(v, 4))
+    df["Прогнозная цена"] = df["Прогнозная цена"].apply(lambda v: _fmt_num(v, 2))
+    df["Прогнозная стоимость"] = df["Прогнозная стоимость"].apply(lambda v: _fmt_num(v, 2))
+    return df
+
+
+def _get_source_stock_df(session) -> pd.DataFrame:
+    """
+    Лист «Исх: Остатки складов» — начальные остатки до распределения.
+
+    Показывает kolichestvo (полный исходный остаток, не изменяется алгоритмом).
+    В отличие от листа «Остатки складов после распределения», здесь нет уменьшений.
+    """
+    sql = text("""
+        SELECT
+            wh.kod_sklada                               AS "Склад",
+            wh.filial                                   AS "Филиал склада",
+            wh.zavod                                    AS "Завод склада",
+            m.sys_nomer                                 AS "Системный номер",
+            m.naimenovanie                              AS "Наименование материала",
+            m.ed_izm                                    AS "Ед.изм",
+            m.gruppa                                    AS "Группа",
+            sb.nomer_partii                             AS "Номер партии",
+            sb.data_postupleniya                        AS "Дата поступления",
+            CAST(sb.kolichestvo AS NUMERIC(18,4))       AS "Кол-во (исходное)",
+            CAST(sb.stoimost_za_ed AS NUMERIC(18,2))    AS "Цена за ед.",
+            CAST(sb.kolichestvo * sb.stoimost_za_ed AS NUMERIC(18,2)) AS "Сумма"
+        FROM stock_batches sb
+        JOIN warehouses wh ON sb.warehouse_id = wh.id
+        JOIN materials   m ON sb.material_id  = m.id
+        ORDER BY
+            wh.kod_sklada,
+            m.sys_nomer,
+            sb.data_postupleniya
+    """)
+    rows = session.execute(sql).fetchall()
+    df = _to_df(rows)
+    if df.empty:
+        return df
+    if "Дата поступления" in df.columns:
+        df["Дата поступления"] = df["Дата поступления"].apply(_fmt_date)
+    df["Кол-во (исходное)"] = df["Кол-во (исходное)"].apply(lambda v: _fmt_num(v, 4))
+    df["Цена за ед."] = df["Цена за ед."].apply(lambda v: _fmt_num(v, 2))
+    df["Сумма"] = df["Сумма"].apply(lambda v: _fmt_num(v, 2))
+    return df
+
+
+def _get_source_supplies_df(session) -> pd.DataFrame:
+    """
+    Лист «Исх: Поставки» — все строки поставок, загруженные в систему.
+
+    Показывает полный реестр материалов «в пути» по договорам.
+    """
+    sql = text("""
+        SELECT
+            s.dogovor                                   AS "Договор",
+            s.postavshchik                              AS "Поставщик",
+            s.data_postavki                             AS "Дата поставки",
+            s.filial                                    AS "Филиал",
+            s.zavod                                     AS "Завод",
+            s.status                                    AS "Статус поставки",
+            m.sys_nomer                                 AS "Системный номер",
+            m.naimenovanie                              AS "Наименование материала",
+            m.ed_izm                                    AS "Ед.изм",
+            CAST(sl.kolichestvo AS NUMERIC(18,4))       AS "Кол-во",
+            CAST(sl.stoimost_za_ed AS NUMERIC(18,2))    AS "Цена за ед.",
+            CAST(sl.kolichestvo * sl.stoimost_za_ed AS NUMERIC(18,2)) AS "Сумма"
+        FROM supply_lines sl
+        JOIN supplies  s ON s.id = sl.supply_id
+        JOIN materials m ON m.id = sl.material_id
+        ORDER BY
+            s.data_postavki ASC NULLS LAST,
+            s.dogovor,
+            m.sys_nomer
+    """)
+    rows = session.execute(sql).fetchall()
+    df = _to_df(rows)
+    if df.empty:
+        return df
+    if "Дата поставки" in df.columns:
+        df["Дата поставки"] = df["Дата поставки"].apply(_fmt_date)
+    df["Кол-во"] = df["Кол-во"].apply(lambda v: _fmt_num(v, 4))
+    df["Цена за ед."] = df["Цена за ед."].apply(lambda v: _fmt_num(v, 2))
+    df["Сумма"] = df["Сумма"].apply(lambda v: _fmt_num(v, 2))
+    return df
 
 
 # =============================================================================

@@ -50,6 +50,7 @@ from app.db.database import get_session
 from app.db.models import (
     AllocationResult,
     AllocationSession,
+    ApprovedTransfer,
     DeficitRecord,
     IssuedNotWrittenOff,
     Requirement,
@@ -62,14 +63,19 @@ from app.db.models import (
     WriteOff,
 )
 from app.models.schemas import (
+    ApprovedTransferImportRow,
     IssuedNotWrittenOffImportRow,
     StockImportRow,
     SupplyImportRow,
     WorkImportRow,
-    WorkListImportRow,  # Схема для импорта перечня работ (наименования, даты)
+    WorkListImportRow,
     WriteOffImportRow,
 )
-from app.repositories.material_repository import MaterialRepository, StockBatchRepository
+from app.repositories.material_repository import (
+    ApprovedTransferRepository,
+    MaterialRepository,
+    StockBatchRepository,
+)
 from app.repositories.work_repository import RequirementRepository, WorkRepository
 
 logger = get_logger(__name__)
@@ -164,6 +170,19 @@ ISSUED_COLUMN_MAP = {
 # Этот файл содержит мастер-данные: наименования и даты работ.
 # В нём НЕТ материалов или количеств — только описание самих работ.
 # Загружается командой: maps import-works <file>
+# Колонки для файла согласованных перемещений.
+# Совпадает со структурой листа «Возможное перемещение» из отчёта:
+# пользователь копирует строки из этого листа, редактирует количество и загружает.
+APPROVED_TRANSFERS_COLUMN_MAP = {
+    "Системный номер":      "sys_nomer_materiala",   # Материал
+    "Склад-источник":       "kod_sklada_istochnik",  # Откуда берём (другой филиал)
+    "Филиал-получатель":    "to_filial",             # Кому отдаём
+    "Кол-во согласовано":   "kolichestvo",           # Сколько согласовано к переброске
+    # Альтернативные заголовки (на случай если пользователь взял лист напрямую из отчёта)
+    "Возможное кол-во":     "kolichestvo",           # из листа «Возможное перемещение»
+    "Куда (филиал)":        "to_filial",
+}
+
 WORKS_COLUMN_MAP = {
     "Код работы":           "kod_raboty",         # Обязательная колонка — ключ записи
     "Наименование работы":  "nazvanie",            # Человекочитаемое описание работы
@@ -1165,4 +1184,115 @@ def import_works(file_path: Path, sheet_name: int | str = 0) -> dict[str, int]:
             stats["created"], stats["updated"], stats["errors"],
         )
 
+    return stats
+
+
+# =============================================================================
+# Импорт согласованных межфилиальных перемещений
+# =============================================================================
+
+def import_approved_transfers(
+    file_path: Path,
+    sheet_name: int | str = 0,
+) -> dict[str, int]:
+    """
+    Загрузить файл согласованных межфилиальных перемещений.
+
+    Что происходит при импорте:
+        1. Все предыдущие записи УДАЛЯЮТСЯ (замена, не дополнение).
+        2. Каждая строка файла создаёт запись ApprovedTransfer.
+        3. После импорта нужно повторно запустить распределение:
+           алгоритм учтёт согласованные перемещения как Layer 3в.
+
+    Формат Excel:
+        | Системный номер | Склад-источник | Филиал-получатель | Кол-во согласовано |
+
+    Совет пользователю:
+        Возьмите лист «Возможное перемещение» из Excel-отчёта,
+        оставьте только согласованные строки и при необходимости
+        скорректируйте количество в колонке «Кол-во согласовано».
+
+    Args:
+        file_path:  Путь к .xlsx файлу с согласованными перемещениями
+        sheet_name: Лист Excel (по умолчанию первый)
+
+    Returns:
+        {"created": N, "errors": K, "skipped": M}
+    """
+    df = _read_excel(file_path, sheet_name)
+    df = _rename_columns(df, APPROVED_TRANSFERS_COLUMN_MAP)
+
+    stats: dict[str, int] = {"created": 0, "errors": 0, "skipped": 0}
+
+    with get_session() as session:
+        transfer_repo = ApprovedTransferRepository(session)
+        mat_repo = MaterialRepository(session)
+
+        # Удаляем предыдущие записи — новый файл полностью заменяет старый
+        transfer_repo.delete_all()
+        logger.info("Старые согласованные перемещения удалены. Загружаем новые...")
+
+        # Кэш: {kod_sklada: Warehouse} — чтобы не делать SELECT для каждой строки
+        warehouse_cache: dict[str, Optional[Warehouse]] = {}
+
+        for idx, row in df.iterrows():
+            row_dict = row.to_dict()
+
+            try:
+                validated = ApprovedTransferImportRow(**row_dict)
+            except ValidationError as e:
+                stats["errors"] += 1
+                logger.warning(
+                    "Строка %d (согласованные перемещения): ошибка валидации: %s",
+                    idx, e.errors()[0]["msg"] if e.errors() else str(e),
+                )
+                continue
+
+            # --- Находим материал ---
+            material = mat_repo.get_by_sys_nomer(validated.sys_nomer_materiala)
+            if material is None:
+                # Материала нет в БД — перемещение не нужно создавать
+                stats["skipped"] += 1
+                logger.warning(
+                    "Строка %d: материал '%s' не найден в БД — строка пропущена",
+                    idx, validated.sys_nomer_materiala,
+                )
+                continue
+
+            # --- Находим склад-источник ---
+            kod_sklada = validated.kod_sklada_istochnik
+            if kod_sklada not in warehouse_cache:
+                from sqlalchemy import select as sa_select
+                warehouse_cache[kod_sklada] = session.scalar(
+                    sa_select(Warehouse).where(Warehouse.kod_sklada == kod_sklada)
+                )
+
+            warehouse = warehouse_cache[kod_sklada]
+            if warehouse is None:
+                stats["skipped"] += 1
+                logger.warning(
+                    "Строка %d: склад '%s' не найден в БД — строка пропущена",
+                    idx, kod_sklada,
+                )
+                continue
+
+            # --- Создаём запись согласованного перемещения ---
+            transfer = ApprovedTransfer(
+                material_id=material.id,
+                from_warehouse_id=warehouse.id,
+                to_filial=validated.to_filial,
+                kolichestvo=validated.kolichestvo,
+                dostupno=validated.kolichestvo,  # Сразу доступно всё согласованное количество
+            )
+            session.add(transfer)
+            stats["created"] += 1
+
+            # Периодический flush для освобождения памяти
+            if stats["created"] % 200 == 0:
+                session.flush()
+
+    logger.info(
+        "Импорт согласованных перемещений завершён: создано=%d, пропущено=%d, ошибок=%d",
+        stats["created"], stats["skipped"], stats["errors"],
+    )
     return stats

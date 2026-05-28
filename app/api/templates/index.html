@@ -237,7 +237,7 @@
                         </div>
 
                         <!-- Выдано не списано -->
-                        <div class="accordion-item import-card rounded-3 overflow-hidden">
+                        <div class="accordion-item import-card mb-2 rounded-3 overflow-hidden">
                             <h2 class="accordion-header">
                                 <button class="accordion-button collapsed py-2" type="button"
                                         data-bs-toggle="collapse" data-bs-target="#imp-iss">
@@ -250,6 +250,39 @@
                                     <input type="file" class="form-control form-control-sm" accept=".xlsx,.xls"
                                            onchange="uploadFile(this, '/api/import/issued', 'res-iss')">
                                     <div id="res-iss" class="upload-result"></div>
+                                </div>
+                            </div>
+                        </div>
+
+                        <!-- Согласованные перемещения (шаг 2 — после первого распределения) -->
+                        <div class="accordion-item rounded-3 overflow-hidden"
+                             style="border: 1.5px solid #fd7e14; box-shadow: 0 1px 4px rgba(253,126,20,.15);">
+                            <h2 class="accordion-header">
+                                <button class="accordion-button collapsed py-2" type="button"
+                                        data-bs-toggle="collapse" data-bs-target="#imp-transfers"
+                                        style="background: #fff8f2;">
+                                    <i class="bi bi-arrow-left-right me-2 text-warning"></i>
+                                    Согласованные перемещения (Слой 3в)
+                                    <span class="badge bg-warning text-dark ms-2" style="font-size:0.65rem;">Шаг 2</span>
+                                </button>
+                            </h2>
+                            <div id="imp-transfers" class="accordion-collapse collapse">
+                                <div class="accordion-body py-2">
+                                    <p class="text-muted small mb-2">
+                                        <i class="bi bi-info-circle me-1"></i>
+                                        Загружайте <strong>после первого распределения</strong>.
+                                        Проанализируйте лист «Возможное перемещение» в отчёте,
+                                        согласуйте перемещения с другими филиалами и загрузите файл.
+                                        Затем запустите распределение повторно.
+                                    </p>
+                                    <p class="text-muted small mb-2">
+                                        Обязательные колонки: <code>Системный номер</code>,
+                                        <code>Склад-источник</code>, <code>Филиал-получатель</code>,
+                                        <code>Кол-во согласовано</code>.
+                                    </p>
+                                    <input type="file" class="form-control form-control-sm" accept=".xlsx,.xls"
+                                           onchange="uploadFile(this, '/api/import/transfers', 'res-transfers')">
+                                    <div id="res-transfers" class="upload-result"></div>
                                 </div>
                             </div>
                         </div>

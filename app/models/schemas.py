@@ -29,6 +29,62 @@ from pydantic import BaseModel, Field, field_validator, model_validator
 
 
 # =============================================================================
+# Вспомогательные функции парсинга данных в русском формате
+# =============================================================================
+
+def _parse_decimal_ru(v: object) -> Decimal:
+    """
+    Преобразовать число из любого формата в Decimal.
+
+    Поддерживаемые форматы (все встречаются в SAP/Excel выгрузках):
+        "1234,56"     — запятая как разделитель дробной части (русский формат)
+        "1 234,56"    — пробел как разделитель тысяч + запятая
+        "1234.56"     — точка (английский формат)
+        1234.56       — float из pandas
+        1234          — int
+
+    Возвращает Decimal с точностью 4 знака после запятой.
+    """
+    if v is None or str(v).strip() in ("", "nan", "None"):
+        return Decimal("0")
+    # Убираем пробелы-разделители тысяч и заменяем запятую на точку
+    s = str(v).strip().replace(" ", "").replace(",", ".")
+    try:
+        return Decimal(s).quantize(Decimal("0.0001"))
+    except Exception:
+        raise ValueError(f"Некорректное числовое значение: {v!r}")
+
+
+def _parse_date_ru(v: object) -> Optional[date]:
+    """
+    Разобрать дату из любого формата.
+
+    Поддерживаемые форматы:
+        "28.05.2026"  — ДД.ММ.ГГГГ (русский формат SAP/Excel)
+        "2026-05-28"  — ISO формат
+        date/datetime — уже готовые объекты Python
+        pandas Timestamp — автоматически приводится
+
+    Возвращает date или None если поле пустое.
+    """
+    if v is None or str(v).strip() in ("", "nan", "None", "NaT"):
+        return None
+    if isinstance(v, date):
+        return v
+    if hasattr(v, "date") and callable(getattr(v, "date")):
+        # pandas Timestamp или datetime → date
+        return getattr(v, "date")()
+    s = str(v).strip()
+    # Пробуем русский формат ДД.ММ.ГГГГ
+    for fmt in ("%d.%m.%Y", "%Y-%m-%d", "%d/%m/%Y"):
+        try:
+            return datetime.strptime(s, fmt).date()
+        except ValueError:
+            continue
+    raise ValueError(f"Не удалось разобрать дату: {v!r}. Ожидаемый формат: ДД.ММ.ГГГГ")
+
+
+# =============================================================================
 # Базовый класс — общие настройки для всех схем
 # =============================================================================
 class MapsBaseModel(BaseModel):
@@ -84,7 +140,7 @@ class WorkImportRow(MapsBaseModel):
         if v is None or str(v).strip() in ("", "nan", "None"):
             return Decimal("0")
         try:
-            return Decimal(str(v)).quantize(Decimal("0.0001"))
+            return _parse_decimal_ru(v)
         except Exception:
             return Decimal("0")
 
@@ -109,12 +165,9 @@ class WorkImportRow(MapsBaseModel):
     def parse_quantity(cls, v: object) -> Decimal:
         """
         Преобразуем количество из любого числового формата в Decimal.
-        Excel может хранить числа как int, float или строку.
+        Поддерживает русский формат: "1 234,56" → Decimal("1234.5600")
         """
-        try:
-            return Decimal(str(v)).quantize(Decimal("0.0001"))
-        except Exception:
-            raise ValueError(f"Некорректное количество: {v!r}")
+        return _parse_decimal_ru(v)
 
 
 
@@ -173,6 +226,15 @@ class WorkListImportRow(MapsBaseModel):
             # Числовой код из Excel: "WO12345.0" → "WO12345"
             s = s[:-2]
         return s
+
+    @field_validator("data_nachala", "data_okonchaniya", mode="before")
+    @classmethod
+    def parse_date(cls, v: object) -> Optional[date]:
+        """
+        Разобрать дату в любом формате: ДД.ММ.ГГГГ, ГГГГ-ММ-ДД, pandas Timestamp.
+        SAP/Excel выгружают даты в формате ДД.ММ.ГГГГ.
+        """
+        return _parse_date_ru(v)
 
     @model_validator(mode="after")
     def check_dates(self) -> "WorkListImportRow":
@@ -244,10 +306,8 @@ class StockImportRow(MapsBaseModel):
     @field_validator("kolichestvo", "stoimost_za_ed", mode="before")
     @classmethod
     def parse_decimal(cls, v: object) -> Decimal:
-        try:
-            return Decimal(str(v)).quantize(Decimal("0.0001"))
-        except Exception:
-            raise ValueError(f"Некорректное числовое значение: {v!r}")
+        """Разбирает число в русском формате: "1 234,56" → Decimal("1234.5600")."""
+        return _parse_decimal_ru(v)
 
 
 # =============================================================================
@@ -285,10 +345,8 @@ class SupplyImportRow(MapsBaseModel):
     @field_validator("kolichestvo", "stoimost_za_ed", mode="before")
     @classmethod
     def parse_decimal(cls, v: object) -> Decimal:
-        try:
-            return Decimal(str(v)).quantize(Decimal("0.0001"))
-        except Exception:
-            raise ValueError(f"Некорректное числовое значение: {v!r}")
+        """Разбирает число в русском формате: "1 234,56" → Decimal("1234.5600")."""
+        return _parse_decimal_ru(v)
 
 
 # =============================================================================
@@ -357,17 +415,8 @@ class WriteOffImportRow(MapsBaseModel):
     @field_validator("kolichestvo", "stoimost_za_ed", "summa", mode="before")
     @classmethod
     def parse_decimal(cls, v: object) -> Decimal:
-        """
-        Преобразование числовых полей из любого формата в Decimal.
-        В Excel числа могут быть int, float, строкой или пустыми.
-        Decimal точнее float для финансовых вычислений.
-        """
-        if v is None or str(v).strip() in ("", "nan", "None"):
-            return Decimal("0")
-        try:
-            return Decimal(str(v)).quantize(Decimal("0.0001"))
-        except Exception:
-            raise ValueError(f"Некорректное числовое значение: {v!r}")
+        """Разбирает число в русском формате: "1 234,56" → Decimal("1234.5600")."""
+        return _parse_decimal_ru(v)
 
 
 # =============================================================================
@@ -422,13 +471,62 @@ class IssuedNotWrittenOffImportRow(MapsBaseModel):
     @field_validator("kolichestvo", "stoimost_za_ed", "summa", mode="before")
     @classmethod
     def parse_decimal(cls, v: object) -> Decimal:
-        """Преобразование числовых полей из любого формата в Decimal."""
-        if v is None or str(v).strip() in ("", "nan", "None"):
-            return Decimal("0")
-        try:
-            return Decimal(str(v)).quantize(Decimal("0.0001"))
-        except Exception:
-            raise ValueError(f"Некорректное числовое значение: {v!r}")
+        """Разбирает число в русском формате: "1 234,56" → Decimal("1234.5600")."""
+        return _parse_decimal_ru(v)
+
+
+# =============================================================================
+# Схема для согласованных межфилиальных перемещений (Слой 3в распределения)
+# =============================================================================
+
+class ApprovedTransferImportRow(MapsBaseModel):
+    """
+    Схема одной строки Excel при импорте согласованных межфилиальных перемещений.
+
+    Что это такое?
+        После первого распределения руководитель смотрит лист «Возможное перемещение»
+        и согласовывает конкретные переброски материала между филиалами.
+        Этот файл — формализация таких согласований.
+
+    Откуда берётся файл?
+        Пользователь копирует строки из листа «Возможное перемещение» в Excel,
+        оставляет только согласованные строки и корректирует количество если нужно.
+        Затем загружает этот файл в MAPS.
+
+    Формат Excel (колонки):
+        | Системный номер | Склад-источник | Филиал-получатель | Кол-во согласовано |
+
+    Пример строки:
+        "000000000010010001" | "SKL-ALM-01" | "Астана" | "100"
+        → Разрешено взять 100 единиц материала 10010001 со склада SKL-ALM-01 для Астаны
+
+    При повторном импорте — все предыдущие записи УДАЛЯЮТСЯ и заменяются новыми.
+    """
+    # Какой материал
+    sys_nomer_materiala: str = Field(..., description="Системный номер материала SAP")
+    # С какого склада (код склада в системе)
+    kod_sklada_istochnik: str = Field(..., description="Код склада-источника (другой филиал)")
+    # В какой филиал (куда перемещаем)
+    to_filial: str = Field(..., description="Филиал-получатель (тот, у кого был дефицит)")
+    # Сколько разрешено переместить
+    kolichestvo: Decimal = Field(..., description="Согласованное количество", gt=0)
+
+    @field_validator("sys_nomer_materiala", "kod_sklada_istochnik", "to_filial", mode="before")
+    @classmethod
+    def clean_string(cls, v: object) -> str:
+        """Нормализация строковых полей: убираем пробелы, исправляем '.0'."""
+        if v is None:
+            return ""
+        s = str(v).strip()
+        if s.endswith(".0"):
+            s = s[:-2]
+        return s
+
+    @field_validator("kolichestvo", mode="before")
+    @classmethod
+    def parse_decimal(cls, v: object) -> Decimal:
+        """Разбирает число в русском формате: "1 234,56" → Decimal("1234.5600")."""
+        return _parse_decimal_ru(v)
 
 
 class AllocationResultOut(MapsBaseModel):

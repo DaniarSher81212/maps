@@ -21,6 +21,7 @@ from sqlalchemy.orm import Session, joinedload
 
 from app.core.logging_config import get_logger
 from app.db.models import (
+    ApprovedTransfer,
     IssuedNotWrittenOff,
     Material,
     StockBatch,
@@ -258,6 +259,40 @@ class StockBatchRepository(BaseRepository[StockBatch]):
         self.session.execute(stmt)
         logger.info("Остатки партий сброшены: dostupno = kolichestvo")
 
+    def get_batches_for_warehouse_material(
+        self,
+        warehouse_id: int,
+        material_id: int,
+        min_qty: Decimal = Decimal("0.0001"),
+    ) -> list[StockBatch]:
+        """
+        Получить FIFO-упорядоченные партии конкретного склада для данного материала.
+
+        Используется в Layer 3в (согласованные перемещения):
+        когда мы знаем конкретный склад-источник, нужно взять его партии FIFO.
+
+        Args:
+            warehouse_id: ID склада-источника (из ApprovedTransfer.from_warehouse_id)
+            material_id:  ID материала
+            min_qty:      Минимальный остаток (пустые партии не берём)
+
+        Returns:
+            Список партий отсортированных от старой к новой (FIFO)
+        """
+        stmt = (
+            select(StockBatch)
+            .where(
+                StockBatch.warehouse_id == warehouse_id,
+                StockBatch.material_id == material_id,
+                StockBatch.dostupno >= min_qty,
+            )
+            .order_by(
+                StockBatch.data_postupleniya.asc().nulls_last(),
+                StockBatch.id.asc(),
+            )
+        )
+        return list(self.session.scalars(stmt).all())
+
     def bulk_create(self, batches: list[StockBatch]) -> None:
         """Массовое добавление партий (для импорта Excel)."""
         self.session.add_all(batches)
@@ -352,6 +387,86 @@ class SupplyRepository(BaseRepository[Supply]):
         stmt = update(SupplyLine).values(dostupno=SupplyLine.kolichestvo)
         self.session.execute(stmt)
         logger.info("Остатки строк поставок сброшены: dostupno = kolichestvo")
+
+
+# =============================================================================
+# Репозиторий согласованных перемещений (Слой 3в распределения)
+# =============================================================================
+
+class ApprovedTransferRepository:
+    """
+    Репозиторий для работы с согласованными межфилиальными перемещениями.
+
+    ApprovedTransfer — это разрешение на использование материала с чужого склада:
+    «Можно взять X единиц материала M со склада W (другой филиал) для филиала F».
+
+    Загружается один раз в начале AllocationEngine.run(), хранится в памяти
+    как словарь {(material_id, to_filial): [ApprovedTransfer, ...]} для O(1) доступа.
+    """
+
+    def __init__(self, session: Session) -> None:
+        self.session = session
+
+    def get_grouped_by_material_filial(
+        self,
+    ) -> dict[tuple[int, str], list[ApprovedTransfer]]:
+        """
+        Загрузить все согласованные перемещения и сгруппировать по (material_id, to_filial).
+
+        Ключ словаря — пара (ID материала, код филиала-получателя).
+        Это позволяет алгоритму мгновенно найти все доступные перемещения
+        для любой пары материал+работа.
+
+        Returns:
+            {(material_id, to_filial): [ApprovedTransfer, ...]}
+        """
+        stmt = (
+            select(ApprovedTransfer)
+            # Загружаем связанный warehouse чтобы потом иметь доступ к from_warehouse_id
+            .order_by(ApprovedTransfer.id.asc())
+        )
+        all_transfers = list(self.session.scalars(stmt).all())
+
+        result: dict[tuple[int, str], list[ApprovedTransfer]] = {}
+        for t in all_transfers:
+            key = (t.material_id, t.to_filial)
+            result.setdefault(key, []).append(t)
+
+        logger.debug(
+            "Загружено согласованных перемещений: %d (по %d парам материал+филиал)",
+            len(all_transfers), len(result),
+        )
+        return result
+
+    def reset_dostupno(self) -> None:
+        """
+        Сбросить dostupno = kolichestvo для всех согласованных перемещений.
+
+        Вызывается в начале каждого запуска AllocationEngine перед основным циклом.
+        Без сброса повторный запуск увидит исчерпанные разрешения от предыдущего запуска.
+        """
+        from sqlalchemy import update as sa_update
+        stmt = sa_update(ApprovedTransfer).values(dostupno=ApprovedTransfer.kolichestvo)
+        self.session.execute(stmt)
+        logger.info("Согласованные перемещения сброшены: dostupno = kolichestvo")
+
+    def delete_all(self) -> None:
+        """
+        Удалить все записи согласованных перемещений.
+
+        Вызывается при импорте нового файла согласований:
+        предыдущий набор полностью заменяется новым.
+        """
+        from sqlalchemy import delete as sa_delete
+        self.session.execute(sa_delete(ApprovedTransfer))
+        logger.info("Все согласованные перемещения удалены (перед новым импортом)")
+
+    def count(self) -> int:
+        """Вернуть количество записей согласованных перемещений."""
+        from sqlalchemy import func
+        return self.session.scalar(
+            select(func.count(ApprovedTransfer.id))
+        ) or 0
 
 
 # =============================================================================

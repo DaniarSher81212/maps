@@ -8,6 +8,7 @@ POST /api/import/stock         — складские остатки (парти
 POST /api/import/supplies      — поставки / материалы в пути (Слой 4)
 POST /api/import/writeoffs     — фактические списания (Слой 1)
 POST /api/import/issued        — выдано не списано (Слой 2)
+POST /api/import/transfers     — согласованные межфилиальные перемещения (Слой 3в)
 
 Как работает загрузка файла:
     1. Браузер отправляет multipart/form-data POST запрос с файлом
@@ -27,6 +28,7 @@ from pathlib import Path
 from fastapi import APIRouter, File, HTTPException, UploadFile
 
 from app.services.import_service import (
+    import_approved_transfers,
     import_emergency_works,
     import_issued_not_written_off,
     import_requirements,
@@ -189,4 +191,43 @@ async def upload_works(file: UploadFile = File(...)) -> dict:
         raise HTTPException(status_code=422, detail=str(e))
     finally:
         # Удаляем временный файл в любом случае (даже при ошибке)
+        tmp_path.unlink(missing_ok=True)
+
+
+@router.post("/import/transfers")
+async def import_transfers_endpoint(file: UploadFile = File(...)) -> dict:
+    """
+    Загрузить Excel с согласованными межфилиальными перемещениями (Слой 3в).
+
+    Когда использовать?
+        1. Сначала запустите распределение (POST /api/allocate)
+        2. Откройте отчёт, лист «Возможное перемещение»
+        3. Согласуйте нужные перемещения с другими филиалами
+        4. Загрузите файл через этот эндпоинт
+        5. Запустите распределение повторно — согласованные перемещения
+           будут использованы как реальный источник (остатки склада уменьшатся)
+
+    Ожидаемый формат Excel (обязательные колонки):
+        Системный номер    — sys_nomer материала
+        Склад-источник     — kod_sklada склада, откуда берём материал
+        Филиал-получатель  — to_filial, куда идёт материал (как в works.filial)
+        Кол-во согласовано — согласованное количество (> 0)
+
+    Альтернативные заголовки (поддерживаются автоматически):
+        «Возможное кол-во» вместо «Кол-во согласовано»
+        «Куда (филиал)»    вместо «Филиал-получатель»
+
+    ВАЖНО: каждая загрузка ПОЛНОСТЬЮ ЗАМЕНЯЕТ предыдущие данные.
+    Старые записи удаляются перед сохранением новых.
+
+    Returns:
+        {"status": "ok", "stats": {"created": N, "errors": K, "skipped": M}}
+    """
+    tmp_path = await _save_upload(file)
+    try:
+        stats = import_approved_transfers(tmp_path)
+        return {"status": "ok", "file": file.filename, "stats": stats}
+    except Exception as e:
+        raise HTTPException(status_code=422, detail=str(e))
+    finally:
         tmp_path.unlink(missing_ok=True)
