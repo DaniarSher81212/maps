@@ -111,19 +111,22 @@ def test_schemas_negative_quantity_rejected() -> None:
 def test_schemas_date_validation() -> None:
     """
     Тест: Дата начала не может быть позже даты окончания.
+
+    Проверяем WorkListImportRow — именно эта схема используется при импорте
+    «Перечня работ» и содержит model_validator на даты.
+    WorkImportRow (файл потребностей) полей дат не имеет — даты приходят
+    только через import-works (WorkListImportRow).
     """
     from pydantic import ValidationError
 
-    from app.models.schemas import WorkImportRow
+    from app.models.schemas import WorkListImportRow
 
     import pytest  # noqa: PLC0415
 
     with pytest.raises(ValidationError):
-        WorkImportRow(
+        WorkListImportRow(
             kod_raboty="WO-001",
-            sys_nomer_materiala="000000000010010001",
-            potrebnost="50",
-            data_nachala="2026-12-31",   # Позже окончания!
+            data_nachala="2026-12-31",   # Позже окончания — должна быть ошибка!
             data_okonchaniya="2026-01-01",
         )
 

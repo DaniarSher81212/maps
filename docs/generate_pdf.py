@@ -246,8 +246,9 @@ if __name__ == "__main__":
     root_dir = docs_dir.parent
 
     files = {
-        root_dir / "README.md":        docs_dir / "README.pdf",
-        docs_dir / "ИНСТРУКЦИЯ.md":    docs_dir / "ИНСТРУКЦИЯ.pdf",
+        root_dir / "README.md":              docs_dir / "README.pdf",
+        docs_dir / "ИНСТРУКЦИЯ.md":          docs_dir / "ИНСТРУКЦИЯ.pdf",
+        docs_dir / "ТЗ_ПРЕЗЕНТАЦИЯ.md":      docs_dir / "ТЗ_ПРЕЗЕНТАЦИЯ.pdf",
     }
 
     print("Генерация PDF-документации MAPS\n")

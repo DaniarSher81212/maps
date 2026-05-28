@@ -1,10 +1,11 @@
 """
 app/api/routes/import_.py — Эндпоинты загрузки Excel-файлов
 
-POST /api/import/requirements  — потребности в материалах
-POST /api/import/emergency     — аварийные работы
-POST /api/import/stock         — складские остатки
-POST /api/import/supplies      — поставки (материалы в пути)
+POST /api/import/works         — перечень работ (мастер-данные: наименования, даты, филиал)
+POST /api/import/requirements  — потребности в материалах по работам
+POST /api/import/emergency     — аварийные работы (наивысший приоритет)
+POST /api/import/stock         — складские остатки (партии, Слой 3)
+POST /api/import/supplies      — поставки / материалы в пути (Слой 4)
 POST /api/import/writeoffs     — фактические списания (Слой 1)
 POST /api/import/issued        — выдано не списано (Слой 2)
 
@@ -68,7 +69,11 @@ async def import_requirements_endpoint(file: UploadFile = File(...)) -> dict:
     """
     Загрузить Excel с потребностями в материалах.
 
-    Ожидаемый формат Excel: колонки с кодом работы, материалом, количеством, ценой.
+    Ожидаемый формат Excel (обязательные колонки):
+        Код работы | Системный номер материала | Потребность (кол-во) |
+        Приоритет | Филиал | Завод
+
+    Рекомендуется загружать ПОСЛЕ /import/works, чтобы работы уже имели наименования.
     """
     tmp = await _save_upload(file)
     try:

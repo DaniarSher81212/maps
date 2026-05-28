@@ -363,6 +363,7 @@ def import_requirements(file_path: Path, sheet_name: int | str = 0) -> dict[str,
 
             # --- Создаём работу если её ещё нет ---
             # Проверяем: нет в БД И нет среди новых в этой сессии
+            new_work_added = False  # флаг: создали ли новую работу В ЭТОЙ итерации
             if (validated.kod_raboty not in existing_works
                     and validated.kod_raboty not in new_works_in_session):
                 # Даты не передаём — они устанавливаются только через «Перечень работ»
@@ -379,8 +380,10 @@ def import_requirements(file_path: Path, sheet_name: int | str = 0) -> dict[str,
                 )
                 new_works_in_session.add(validated.kod_raboty)
                 stats["works"] += 1
+                new_work_added = True  # работа только что добавлена, id ещё None
 
             # --- Создаём материал если его ещё нет ---
+            new_material_added = False  # флаг: создали ли новый материал В ЭТОЙ итерации
             if (validated.sys_nomer_materiala not in existing_materials
                     and validated.sys_nomer_materiala not in new_materials_in_session):
                 material_repo.get_or_create(
@@ -389,12 +392,15 @@ def import_requirements(file_path: Path, sheet_name: int | str = 0) -> dict[str,
                     ed_izm=validated.ed_izm,
                 )
                 new_materials_in_session.add(validated.sys_nomer_materiala)
+                new_material_added = True  # материал только что добавлен, id ещё None
 
-            # Flush: сбрасываем накопленные INSERT в PostgreSQL чтобы получить ID.
-            # Делаем это периодически (не каждую строку) для производительности.
-            if stats["requirements"] % 500 == 0:
+            # Flush нужен в двух случаях:
+            #   1. В этой итерации создали новый объект (work или material) — нужен его id
+            #      чтобы get_by_kod() / get_by_sys_nomer() нашли его в БД
+            #   2. Периодически (каждые 500 строк) — освобождаем накопленные изменения в памяти
+            # На строках где work и material уже существовали — flush не нужен (~80% строк)
+            if new_work_added or new_material_added or stats["requirements"] % 500 == 0:
                 session.flush()
-            session.flush()  # Гарантируем наличие ID перед созданием потребности
 
             # --- Создаём потребность ---
             # Находим работу и материал по их кодам (теперь они уже в БД)
@@ -489,6 +495,7 @@ def import_emergency_works(file_path: Path, sheet_name: int | str = 0) -> dict[s
                 continue
 
             # Создаём работу с флагом is_emergency=True (это ключевое отличие!)
+            new_work_added = False  # флаг: создали ли новую работу В ЭТОЙ итерации
             if (validated.kod_raboty not in existing_works
                     and validated.kod_raboty not in new_works_in_session):
                 # Даты не передаём — они устанавливаются только через «Перечень работ»
@@ -505,13 +512,17 @@ def import_emergency_works(file_path: Path, sheet_name: int | str = 0) -> dict[s
                 )
                 new_works_in_session.add(validated.kod_raboty)
                 stats["works"] += 1
+                new_work_added = True  # работа только что добавлена, id ещё None
             else:
-                # Если работа уже существует — помечаем как аварийную
+                # Если работа уже существует — помечаем как аварийную.
+                # get_or_create обновит флаг is_emergency у существующей записи.
+                # Новый объект не создаётся → flush не нужен.
                 work_repo.get_or_create(
                     kod_raboty=validated.kod_raboty,
-                    is_emergency=True,  # get_or_create обновит флаг у существующей работы
+                    is_emergency=True,
                 )
 
+            new_material_added = False  # флаг: создали ли новый материал В ЭТОЙ итерации
             if (validated.sys_nomer_materiala not in existing_materials
                     and validated.sys_nomer_materiala not in new_materials_in_session):
                 material_repo.get_or_create(
@@ -520,8 +531,11 @@ def import_emergency_works(file_path: Path, sheet_name: int | str = 0) -> dict[s
                     ed_izm=validated.ed_izm,
                 )
                 new_materials_in_session.add(validated.sys_nomer_materiala)
+                new_material_added = True  # материал только что добавлен, id ещё None
 
-            session.flush()
+            # Flush только если создали новый объект (нужен id) или каждые 500 строк
+            if new_work_added or new_material_added or stats["requirements"] % 500 == 0:
+                session.flush()
 
             work = work_repo.get_by_kod(validated.kod_raboty)
             material = material_repo.get_by_sys_nomer(validated.sys_nomer_materiala)
@@ -617,10 +631,13 @@ def import_stock(file_path: Path, sheet_name: int | str = 0) -> dict[str, int]:
                 gruppa=validated.gruppa_materiala,
             )
 
-            # Периодический flush для производительности
-            if stats["batches"] % 1000 == 0:
+            # Flush нужен в двух случаях:
+            #   1. Материал только что создан — его id == None, нужен flush чтобы
+            #      PostgreSQL назначил autoincrement и batch.material_id заполнился
+            #   2. Периодически каждые 1000 партий — освобождаем накопленное в памяти
+            # Если материал уже существовал — его id уже установлен, flush не нужен
+            if material.id is None or stats["batches"] % 1000 == 0:
                 session.flush()
-            session.flush()  # Нужен id материала для создания партии
 
             # Создаём партию.
             # dostupno = kolichestvo: изначально весь материал доступен.
@@ -749,7 +766,10 @@ def import_supplies(file_path: Path, sheet_name: int | str = 0) -> dict[str, int
                 naimenovanie=validated.naimenovanie_materiala,
                 ed_izm=validated.ed_izm,
             )
-            session.flush()
+            # Flush нужен только если материал только что создан — нужен его id
+            # для поля material_id в строке поставки SupplyLine
+            if material.id is None:
+                session.flush()
 
             # Строка поставки (конкретный материал в поставке)
             line = SupplyLine(
