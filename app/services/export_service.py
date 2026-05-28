@@ -187,9 +187,9 @@ def export_allocation_results(
         _write_sheet(writer, df_transit_free, "Не распред. в пути")
 
         # Исходные данные
-        _write_sheet(writer, df_src_req,      "Исх: Потребности")
-        _write_sheet(writer, df_src_stock,    "Исх: Остатки складов")
-        _write_sheet(writer, df_src_supplies, "Исх: Поставки")
+        _write_sheet(writer, df_src_req,      "Исх. Потребности")
+        _write_sheet(writer, df_src_stock,    "Исх. Остатки складов")
+        _write_sheet(writer, df_src_supplies, "Исх. Поставки")
 
     logger.info(
         "Отчёт создан: %s | строк в главной таблице: %d",
