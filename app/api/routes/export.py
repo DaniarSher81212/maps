@@ -1,62 +1,70 @@
 """
-app/api/routes/export.py — Эндпоинт скачивания Excel-отчёта
+app/api/routes/export.py — Эндпоинты скачивания Excel-отчётов
 
-GET /api/export/{session_id} — сформировать и скачать Excel-отчёт
+GET /api/export/{session_id}              — полный отчёт (все листы)
+GET /api/export/{session_id}/{sheet_key}  — отдельный лист (deficit, distribution, ...)
 
-Это ключевой эндпоинт для использования с рабочего компа:
-    1. Запустил распределение дома (POST /api/allocate)
-    2. В таблице сессий появилась ссылка:
-       http://192.168.1.x:8000/api/export/20260523_143055_a1b2c
-    3. Эту ссылку можно отправить себе на email / мессенджер
-    4. Открыть с рабочего компа → файл скачается автоматически
-
-Как работает FileResponse в FastAPI:
-    FastAPI потоково отдаёт файл браузеру с правильными HTTP-заголовками:
-      Content-Disposition: attachment; filename="MAPS_отчёт_..."
-      Content-Type: application/vnd.openxmlformats...
-    Браузер получает эти заголовки и открывает диалог «Сохранить файл».
+Допустимые значения sheet_key:
+    distribution, movements, balances, possible, transfers_tmpl, approved,
+    coverage, in_transit, in_transit_free, deficit,
+    src_works, src_req, src_stock, src_supplies, src_writeoffs, src_issued
 """
 
 from fastapi import APIRouter, HTTPException
 from fastapi.responses import FileResponse
 
-from app.services.export_service import export_allocation_results
+from app.services.export_service import SHEET_KEYS, export_allocation_results, export_single_sheet
 
 router = APIRouter()
+
+_XLSX_MIME = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
 
 
 @router.get("/export/{session_id}")
 def download_export(session_id: str) -> FileResponse:
     """
-    Сформировать Excel-отчёт для сессии и вернуть его браузеру как скачиваемый файл.
-
-    Аргументы:
-        session_id: ID сессии распределения (например "20260523_143055_a1b2c")
-
-    Возвращает:
-        Excel-файл (.xlsx) с 7 листами:
-          1. Распределение          — что и откуда распределено по каждой потребности
-          2. Движение склада        — какие партии использованы (FIFO-расход)
-          3. Остатки складов        — остаток каждой партии после распределения
-          4. Возможное перемещение  — потребности, покрытые партиями из других филиалов
-          5. Обеспеченность         — сводная таблица: потребность / покрыто / дефицит
-          6. В пути                 — потребности, покрытые поставками (Слой 4)
-          7. Не распред. в пути     — поставки, которые ни на одну потребность не встали
+    Сформировать полный Excel-отчёт (все листы) и скачать.
 
     Ошибки:
-        400 — если сессия не найдена или произошла ошибка при формировании отчёта
+        400 — если сессия не найдена или ошибка при формировании отчёта
     """
     try:
         file_path = export_allocation_results(session_id)
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Ошибка формирования отчёта: {e}")
 
-    # Имя файла с датой сессии — удобно для сохранения
-    filename = f"MAPS_отчёт_{session_id}.xlsx"
-
     return FileResponse(
         path=str(file_path),
-        filename=filename,
-        # MIME-тип для .xlsx файлов — браузер знает, что это Excel
-        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        filename=f"MAPS_отчёт_{session_id}.xlsx",
+        media_type=_XLSX_MIME,
+    )
+
+
+@router.get("/export/{session_id}/{sheet_key}")
+def download_sheet(session_id: str, sheet_key: str) -> FileResponse:
+    """
+    Сформировать Excel-файл с одним листом отчёта и скачать.
+
+    Параметры:
+        session_id: ID сессии распределения
+        sheet_key:  Ключ листа (deficit, distribution, coverage, src_writeoffs, ...)
+
+    Ошибки:
+        400 — неизвестный sheet_key или ошибка формирования
+    """
+    if sheet_key not in SHEET_KEYS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Неизвестный лист: {sheet_key!r}. Допустимые: {list(SHEET_KEYS)}",
+        )
+    try:
+        file_path = export_single_sheet(session_id, sheet_key)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Ошибка формирования листа: {e}")
+
+    sheet_name = SHEET_KEYS[sheet_key]
+    return FileResponse(
+        path=str(file_path),
+        filename=f"MAPS_{sheet_name}_{session_id}.xlsx",
+        media_type=_XLSX_MIME,
     )

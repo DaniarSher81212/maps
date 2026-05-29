@@ -251,6 +251,56 @@ class WorkListImportRow(MapsBaseModel):
         return self
 
 
+class RequirementsImportRow(MapsBaseModel):
+    """
+    Схема одной строки файла «Потребности» (упрощённый формат).
+
+    Новый формат файла потребностей содержит только данные о материале.
+    Данные работы (филиал, завод, даты) берутся из «Перечня работ»,
+    который загружается отдельно через import-works / import-emergency-works.
+
+    Если работа с указанным кодом не найдена в БД — строка пропускается.
+    Это означает: сначала всегда загружайте «Перечень работ», затем — «Потребности».
+
+    Формат Excel:
+        | Код работы | Группа материалов | Системный номер |
+        | Наименование | Ед.изм | Потребность | Прогнозная цена |
+    """
+    kod_raboty: str = Field(..., description="Код работы", min_length=1)
+    sys_nomer_materiala: str = Field(..., description="Системный номер материала")
+    potrebnost: Decimal = Field(..., description="Потребность в материале", gt=0)
+
+    gruppa_materiala: Optional[str] = None
+    naimenovanie_materiala: Optional[str] = None
+    ed_izm: Optional[str] = None
+    prognosnaya_tsena: Decimal = Field(default=Decimal("0"), ge=0)
+
+    @field_validator("prognosnaya_tsena", mode="before")
+    @classmethod
+    def parse_forecast_price(cls, v: object) -> Decimal:
+        if v is None or str(v).strip() in ("", "nan", "None"):
+            return Decimal("0")
+        try:
+            return _parse_decimal_ru(v)
+        except Exception:
+            return Decimal("0")
+
+    @field_validator("kod_raboty", "sys_nomer_materiala", mode="before")
+    @classmethod
+    def strip_and_upper(cls, v: object) -> str:
+        if v is None:
+            return ""
+        s = str(v).strip()
+        if s.endswith(".0"):
+            s = s[:-2]
+        return s
+
+    @field_validator("potrebnost", mode="before")
+    @classmethod
+    def parse_quantity(cls, v: object) -> Decimal:
+        return _parse_decimal_ru(v)
+
+
 class WorkOut(MapsBaseModel):
     """Схема для вывода информации о работе (например, в API-ответе)."""
     id: int

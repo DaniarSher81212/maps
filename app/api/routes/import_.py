@@ -1,14 +1,15 @@
 """
 app/api/routes/import_.py — Эндпоинты загрузки Excel-файлов
 
-POST /api/import/works         — перечень работ (мастер-данные: наименования, даты, филиал)
-POST /api/import/requirements  — потребности в материалах по работам
-POST /api/import/emergency     — аварийные работы (наивысший приоритет)
-POST /api/import/stock         — складские остатки (партии, Слой 3)
-POST /api/import/supplies      — поставки / материалы в пути (Слой 4)
-POST /api/import/writeoffs     — фактические списания (Слой 1)
-POST /api/import/issued        — выдано не списано (Слой 2)
-POST /api/import/transfers     — согласованные межфилиальные перемещения (Слой 3в)
+POST /api/import/works                   — перечень работ (мастер-данные: наименования, даты, филиал)
+POST /api/import/requirements            — потребности в материалах по работам (только материалы, без оргструктуры)
+POST /api/import/emergency               — перечень аварийных работ (наивысший приоритет)
+POST /api/import/emergency-requirements  — потребности аварийных работ
+POST /api/import/stock                   — складские остатки (партии, Слой 3)
+POST /api/import/supplies                — поставки / материалы в пути (Слой 4)
+POST /api/import/writeoffs               — фактические списания (Слой 1)
+POST /api/import/issued                  — выдано не списано (Слой 2)
+POST /api/import/transfers               — согласованные межфилиальные перемещения (Слой 3в)
 
 Как работает загрузка файла:
     1. Браузер отправляет multipart/form-data POST запрос с файлом
@@ -29,12 +30,13 @@ from fastapi import APIRouter, File, HTTPException, UploadFile
 
 from app.services.import_service import (
     import_approved_transfers,
+    import_emergency_requirements,
     import_emergency_works,
     import_issued_not_written_off,
     import_requirements,
     import_stock,
     import_supplies,
-    import_works,      # Импорт перечня работ с наименованиями (мастер-данные)
+    import_works,
     import_writeoffs,
 )
 
@@ -90,13 +92,38 @@ async def import_requirements_endpoint(file: UploadFile = File(...)) -> dict:
 @router.post("/import/emergency")
 async def import_emergency_endpoint(file: UploadFile = File(...)) -> dict:
     """
-    Загрузить Excel с аварийными работами.
+    Загрузить Excel с перечнем аварийных работ.
 
+    Формат совпадает с «Перечнем работ»:
+        Код работы | Наименование | Дата начала | Дата окончания | Филиал | Завод | Приоритет | Статус
+
+    После загрузки нужно отдельно загрузить потребности через /import/emergency-requirements.
     Аварийные работы получат наивысший приоритет при следующем запуске распределения.
     """
     tmp = await _save_upload(file)
     try:
         stats = import_emergency_works(tmp)
+        return {"status": "ok", "file": file.filename, "stats": stats}
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    finally:
+        tmp.unlink(missing_ok=True)
+
+
+@router.post("/import/emergency-requirements")
+async def import_emergency_requirements_endpoint(file: UploadFile = File(...)) -> dict:
+    """
+    Загрузить Excel с потребностями аварийных работ.
+
+    Формат совпадает с обычными потребностями:
+        Код работы | Группа материалов | Системный номер | Наименование | Ед.изм | Потребность | Прогнозная цена
+
+    Аварийные работы должны быть загружены заранее через /import/emergency.
+    Если работа не найдена — строка пропускается с предупреждением в лог.
+    """
+    tmp = await _save_upload(file)
+    try:
+        stats = import_emergency_requirements(tmp)
         return {"status": "ok", "file": file.filename, "stats": stats}
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))

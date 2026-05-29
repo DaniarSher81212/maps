@@ -157,6 +157,12 @@
                             </h2>
                             <div id="imp-req" class="accordion-collapse collapse">
                                 <div class="accordion-body py-2">
+                                    <p class="text-muted small mb-2">
+                                        Загружать <strong>после</strong> «Перечня работ».
+                                        Колонки: <code>Код работы</code>, <code>Группа материалов</code>,
+                                        <code>Системный номер</code>, <code>Наименование</code>,
+                                        <code>Ед.изм</code>, <code>Потребность</code>, <code>Прогнозная цена</code>
+                                    </p>
                                     <input type="file" class="form-control form-control-sm" accept=".xlsx,.xls"
                                            onchange="uploadFile(this, '/api/import/requirements', 'res-req')">
                                     <div id="res-req" class="upload-result"></div>
@@ -164,20 +170,49 @@
                             </div>
                         </div>
 
-                        <!-- Аварийные работы -->
+                        <!-- Перечень аварийных работ -->
                         <div class="accordion-item import-card mb-2 rounded-3 overflow-hidden">
                             <h2 class="accordion-header">
                                 <button class="accordion-button collapsed py-2" type="button"
                                         data-bs-toggle="collapse" data-bs-target="#imp-emrg">
                                     <i class="bi bi-exclamation-triangle me-2 text-danger"></i>
-                                    Аварийные работы
+                                    Перечень аварийных работ
                                 </button>
                             </h2>
                             <div id="imp-emrg" class="accordion-collapse collapse">
                                 <div class="accordion-body py-2">
+                                    <p class="text-muted small mb-2">
+                                        Колонки: <code>Код работы</code>, <code>Наименование работы</code>,
+                                        <code>Дата начала</code>, <code>Дата окончания</code>,
+                                        <code>Филиал</code>, <code>Завод</code>, <code>Статус</code>
+                                    </p>
                                     <input type="file" class="form-control form-control-sm" accept=".xlsx,.xls"
                                            onchange="uploadFile(this, '/api/import/emergency', 'res-emrg')">
                                     <div id="res-emrg" class="upload-result"></div>
+                                </div>
+                            </div>
+                        </div>
+
+                        <!-- Потребности аварийных работ -->
+                        <div class="accordion-item import-card mb-2 rounded-3 overflow-hidden">
+                            <h2 class="accordion-header">
+                                <button class="accordion-button collapsed py-2" type="button"
+                                        data-bs-toggle="collapse" data-bs-target="#imp-emrg-req">
+                                    <i class="bi bi-file-earmark-spreadsheet me-2 text-danger"></i>
+                                    Потребности аварийных работ
+                                </button>
+                            </h2>
+                            <div id="imp-emrg-req" class="accordion-collapse collapse">
+                                <div class="accordion-body py-2">
+                                    <p class="text-muted small mb-2">
+                                        Загружать <strong>после</strong> «Перечня аварийных работ».
+                                        Колонки: <code>Код работы</code>, <code>Группа материалов</code>,
+                                        <code>Системный номер</code>, <code>Наименование</code>,
+                                        <code>Ед.изм</code>, <code>Потребность</code>, <code>Прогнозная цена</code>
+                                    </p>
+                                    <input type="file" class="form-control form-control-sm" accept=".xlsx,.xls"
+                                           onchange="uploadFile(this, '/api/import/emergency-requirements', 'res-emrg-req')">
+                                    <div id="res-emrg-req" class="upload-result"></div>
                                 </div>
                             </div>
                         </div>
@@ -344,7 +379,8 @@
 </div><!-- /container -->
 
 <div class="mt-5 py-3 text-center text-muted small border-top">
-    MAPS v3.0.0 &nbsp;·&nbsp; <a href="/docs" class="text-muted">API документация</a>
+    MAPS v3.1.0 &nbsp;·&nbsp;
+    <a href="/docs" class="text-muted" target="_blank" rel="noopener">API документация</a>
 </div>
 
 <!-- Bootstrap JS -->
@@ -403,9 +439,20 @@ function updateCurrentSessionCard(s) {
     const badge = statusBadge(s.status);
 
     const downloadBtn = s.status === "completed"
-        ? `<a href="/api/export/${s.id}" class="btn btn-success mt-3">
-               <i class="bi bi-file-earmark-excel me-1"></i>Скачать Excel-отчёт
-           </a>`
+        ? `<div class="mt-3">
+               <a href="/api/export/${s.id}" class="btn btn-success me-2 mb-2">
+                   <i class="bi bi-file-earmark-excel me-1"></i>Полный отчёт
+               </a>
+               <a href="/api/export/${s.id}/deficit" class="btn btn-outline-danger me-2 mb-2">
+                   <i class="bi bi-exclamation-circle me-1"></i>Дефицит
+               </a>
+               <a href="/api/export/${s.id}/distribution" class="btn btn-outline-primary me-2 mb-2">
+                   <i class="bi bi-table me-1"></i>Распределение
+               </a>
+               <a href="/api/export/${s.id}/coverage" class="btn btn-outline-secondary mb-2">
+                   <i class="bi bi-bar-chart me-1"></i>Обеспеченность
+               </a>
+           </div>`
         : "";
 
     body.innerHTML = `

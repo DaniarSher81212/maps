@@ -65,6 +65,7 @@ from app.db.models import (
 from app.models.schemas import (
     ApprovedTransferImportRow,
     IssuedNotWrittenOffImportRow,
+    RequirementsImportRow,
     StockImportRow,
     SupplyImportRow,
     WorkImportRow,
@@ -89,20 +90,16 @@ logger = get_logger(__name__)
 #     Позволяет переименовать колонки при импорте, не меняя бизнес-логику.
 #     Если клиент даст файл с другими заголовками — меняем только этот словарь.
 
-# Колонки для файла потребностей (и аварийных работ — тот же формат)
-# Даты начала/окончания в этом файле НЕТ — они приходят только из «Перечня работ»
-# и хранятся в таблице works. При импорте потребностей код берёт даты оттуда.
+# Колонки для файла потребностей.
+# Новый упрощённый формат: только материальные данные, без оргструктуры работы.
+# Данные работы (филиал, завод, даты, приоритет) берутся из «Перечня работ»,
+# загруженного заранее через import-works или import-emergency-works.
 REQUIREMENTS_COLUMN_MAP = {
     "Код работы":           "kod_raboty",
-    "Тип работы":           "tip_raboty",
-    "Филиал":               "filial",
-    "Подразделение":        "podrazdelenie",
-    "Центр затрат":         "centr_zatrat",
-    "Завод":                "zavod",
-    "Приоритет":            "prioritet",
-    "Статус":               "status",
+    "Группа материалов":    "gruppa_materiala",
     "Системный номер":      "sys_nomer_materiala",
-    "Наименование материала": "naimenovanie_materiala",
+    "Наименование":         "naimenovanie_materiala",
+    "Наименование материала": "naimenovanie_materiala",  # альтернативный заголовок
     "Ед.изм":               "ed_izm",
     "Потребность":          "potrebnost",
     "Прогнозная цена":      "prognosnaya_tsena",
@@ -302,28 +299,27 @@ def import_requirements(file_path: Path, sheet_name: int | str = 0) -> dict[str,
     """
     Импортировать потребности работ в материалах из Excel.
 
-    Файл содержит строки вида:
-    | Код работы | Системный номер | Потребность | Прогнозная цена | Дата начала | ... |
+    Новый упрощённый формат файла:
+        | Код работы | Группа материалов | Системный номер |
+        | Наименование | Ед.изм | Потребность | Прогнозная цена |
 
-    Одна работа → много материалов → много строк Excel →
-    → одна строка в works + много строк в requirements.
+    Работы в этом файле НЕ создаются. Данные работ (филиал, завод, приоритет, даты)
+    должны быть загружены заранее через import-works.
+    Если работа с указанным кодом не найдена — строка пропускается с предупреждением.
 
-    Прогнозная цена (prognosnaya_tsena):
-        Цена за единицу из исходной заявки.
-        Используется для расчёта % обеспечённости по стоимости и стоимости «К закупу».
+    При каждом вызове выполняется полный сброс операционных данных (новый цикл планирования).
 
     Args:
         file_path:  Путь к Excel файлу
         sheet_name: Лист (0 = первый)
 
     Returns:
-        Статистика {"works": 50, "requirements": 1200, "errors": 3}
+        Статистика {"requirements": 1200, "skipped": 5, "errors": 3}
     """
-    # Читаем файл и переименовываем колонки
     df = _read_excel(file_path, sheet_name)
     df = _rename_columns(df, REQUIREMENTS_COLUMN_MAP)
 
-    stats = {"works": 0, "requirements": 0, "errors": 0}
+    stats = {"requirements": 0, "skipped": 0, "errors": 0}
     errors: list[str] = []
 
     with get_session() as session:
@@ -331,15 +327,8 @@ def import_requirements(file_path: Path, sheet_name: int | str = 0) -> dict[str,
         material_repo = MaterialRepository(session)
         req_repo = RequirementRepository(session)
 
-        # Полный сброс операционных данных — import-requirements начинает новый цикл.
-        # Порядок удаления: от дочерних таблиц к родительским (по FK-зависимостям).
-        # materials и warehouses не трогаем — это справочники, пересоздаются через get_or_create.
-        #
-        # ВАЖНО: Таблицу works НЕ очищаем!
-        # Работы — это мастер-данные. Они могут быть загружены заранее через import-works
-        # (с наименованиями и уточнёнными датами). Очистка работ уничтожит эти данные.
-        # Дубли не возникнут: код работы (kod_raboty) уникален, и мы используем
-        # get_or_create — если работа уже существует, она не пересоздаётся.
+        # Полный сброс операционных данных — начинаем новый цикл планирования.
+        # Таблицу works НЕ очищаем — это мастер-данные, загруженные через import-works.
         from sqlalchemy import delete
 
         session.execute(delete(StockMovement))
@@ -352,93 +341,66 @@ def import_requirements(file_path: Path, sheet_name: int | str = 0) -> dict[str,
         session.execute(delete(Supply))
         session.execute(delete(StockBatch))
         session.execute(delete(Requirement))
-        # delete(Work) убрано намеренно — работы являются мастер-данными.
-        # Они загружаются через import-works (с наименованиями) и сохраняются
-        # между циклами импорта. get_or_create ниже предотвращает дубли.
         logger.info("Сброс операционных данных перед новым импортом (работы сохранены)")
 
-        # Предзагружаем существующие работы и материалы в словари для O(1) поиска.
-        # Это важная оптимизация: без неё импорт 10 000 строк = 10 000 SELECT-запросов.
-        existing_works = work_repo.get_kod_map()         # {kod_raboty: id}
+        # Предзагружаем словари для O(1) поиска
+        work_kod_map = work_repo.get_kod_map()           # {kod_raboty: id}
         existing_materials = material_repo.get_id_map()  # {sys_nomer: id}
-
-        # Отслеживаем новые записи внутри текущей сессии (ещё не в словарях выше)
-        new_works_in_session: set[str] = set()
         new_materials_in_session: set[str] = set()
 
         for row_num, row in df.iterrows():
             row_dict = row.to_dict()
 
-            # --- Валидация строки через Pydantic ---
             try:
-                validated = WorkImportRow(**row_dict)
+                validated = RequirementsImportRow(**row_dict)
             except ValidationError as e:
-                # Первая ошибка из списка — обычно самая понятная
                 error_msg = f"Строка {cast(int, row_num) + 2}: {e.errors()[0]['msg']}"
                 errors.append(error_msg)
                 stats["errors"] += 1
                 logger.warning("Ошибка валидации | %s", error_msg)
-                continue  # Пропускаем строку с ошибкой, продолжаем дальше
+                continue
 
-            # --- Создаём работу если её ещё нет ---
-            # Проверяем: нет в БД И нет среди новых в этой сессии
-            new_work_added = False  # флаг: создали ли новую работу В ЭТОЙ итерации
-            if (validated.kod_raboty not in existing_works
-                    and validated.kod_raboty not in new_works_in_session):
-                # Даты не передаём — они устанавливаются только через «Перечень работ»
-                work_repo.get_or_create(
-                    kod_raboty=validated.kod_raboty,
-                    tip_raboty=validated.tip_raboty,
-                    filial=validated.filial,
-                    podrazdelenie=validated.podrazdelenie,
-                    centr_zatrat=validated.centr_zatrat,
-                    zavod=validated.zavod,
-                    prioritet=validated.prioritet,
-                    status=validated.status,
-                    is_emergency=False,
+            # Работа должна уже существовать — загрузите «Перечень работ» первым
+            work_id = work_kod_map.get(validated.kod_raboty)
+            if work_id is None:
+                logger.warning(
+                    "Строка %d: Работа '%s' не найдена. Загрузите «Перечень работ» первым.",
+                    cast(int, row_num) + 2, validated.kod_raboty,
                 )
-                new_works_in_session.add(validated.kod_raboty)
-                stats["works"] += 1
-                new_work_added = True  # работа только что добавлена, id ещё None
+                stats["skipped"] += 1
+                continue
 
-            # --- Создаём материал если его ещё нет ---
-            new_material_added = False  # флаг: создали ли новый материал В ЭТОЙ итерации
+            # Создаём материал если его ещё нет (обновляем группу если изменилась)
+            new_material_added = False
             if (validated.sys_nomer_materiala not in existing_materials
                     and validated.sys_nomer_materiala not in new_materials_in_session):
                 material_repo.get_or_create(
                     sys_nomer=validated.sys_nomer_materiala,
                     naimenovanie=validated.naimenovanie_materiala,
                     ed_izm=validated.ed_izm,
+                    gruppa=validated.gruppa_materiala,
                 )
                 new_materials_in_session.add(validated.sys_nomer_materiala)
-                new_material_added = True  # материал только что добавлен, id ещё None
+                new_material_added = True
 
-            # Flush нужен в двух случаях:
-            #   1. В этой итерации создали новый объект (work или material) — нужен его id
-            #      чтобы get_by_kod() / get_by_sys_nomer() нашли его в БД
-            #   2. Периодически (каждые 500 строк) — освобождаем накопленные изменения в памяти
-            # На строках где work и material уже существовали — flush не нужен (~80% строк)
-            if new_work_added or new_material_added or stats["requirements"] % 500 == 0:
+            if new_material_added or stats["requirements"] % 500 == 0:
                 session.flush()
 
-            # --- Создаём потребность ---
-            # Находим работу и материал по их кодам (теперь они уже в БД)
-            work = work_repo.get_by_kod(validated.kod_raboty)
             material = material_repo.get_by_sys_nomer(validated.sys_nomer_materiala)
+            if not material:
+                continue
 
-            if work and material:
-                # upsert: если такая пара работа+материал уже есть — суммируем количество
-                req_repo.upsert(
-                    work_id=work.id,
-                    material_id=material.id,
-                    potrebnost=validated.potrebnost,
-                    prognosnaya_tsena=validated.prognosnaya_tsena,  # НОВОЕ
-                )
-                stats["requirements"] += 1
+            req_repo.upsert(
+                work_id=work_id,
+                material_id=material.id,
+                potrebnost=validated.potrebnost,
+                prognosnaya_tsena=validated.prognosnaya_tsena,
+            )
+            stats["requirements"] += 1
 
         logger.info(
-            "Импорт потребностей завершён: работ=%d, потребностей=%d, ошибок=%d",
-            stats["works"], stats["requirements"], stats["errors"],
+            "Импорт потребностей завершён: потребностей=%d, пропущено=%d, ошибок=%d",
+            stats["requirements"], stats["skipped"], stats["errors"],
         )
 
     if errors:
@@ -453,33 +415,131 @@ def import_requirements(file_path: Path, sheet_name: int | str = 0) -> dict[str,
 
 def import_emergency_works(file_path: Path, sheet_name: int | str = 0) -> dict[str, int]:
     """
-    Импортировать аварийные работы из отдельного Excel файла.
+    Импортировать перечень аварийных работ из Excel.
 
-    Что такое аварийные работы?
-        Это критичные работы — аварии на оборудовании, нарушения безопасности.
-        Они должны получить материалы ДО любых плановых работ.
-        В MAPS они помечаются is_emergency=True и идут первыми в очереди.
+    Формат файла совпадает с «Перечнем работ» (WORKS_COLUMN_MAP):
+        | Код работы | Наименование работы | Дата начала | Дата окончания |
+        | Филиал | Завод | Приоритет | Статус |
 
-    Формат файла:
-        ТАКОЙ ЖЕ, как обычный файл потребностей (REQUIREMENTS_COLUMN_MAP).
-        Единственное отличие — все работы в нём считаются аварийными.
-        Поле «Приоритет» в файле НЕ влияет на порядок внутри аварийных работ:
-        они сортируются ТОЛЬКО по дате начала.
+    Все загруженные работы получат флаг is_emergency=True и будут обработаны
+    алгоритмом распределения первыми (до любых плановых работ).
+
+    Потребности аварийных работ загружаются отдельно через import_emergency_requirements.
 
     Args:
-        file_path:  Путь к Excel файлу с аварийными работами
+        file_path:  Путь к Excel файлу с перечнем аварийных работ
         sheet_name: Лист (по умолчанию первый)
 
     Returns:
-        Статистика {"works": 5, "requirements": 50, "errors": 0}
+        Статистика {"created": 5, "updated": 2, "errors": 0}
     """
-    logger.info("Импорт АВАРИЙНЫХ работ из: %s", file_path)
+    logger.info("Импорт ПЕРЕЧНЯ АВАРИЙНЫХ работ из: %s", file_path)
 
-    # Формат файла такой же, как обычные потребности — используем тот же маппинг
+    df = _read_excel(file_path, sheet_name)
+    df = _rename_columns(df, WORKS_COLUMN_MAP)
+
+    stats = {"created": 0, "updated": 0, "errors": 0}
+
+    with get_session() as session:
+        from sqlalchemy import delete, select
+
+        # Удаляем потребности аварийных работ перед переимпортом самих работ
+        emergency_work_ids = select(Work.id).where(Work.is_emergency.is_(True))
+        session.execute(delete(Requirement).where(Requirement.work_id.in_(emergency_work_ids)))
+        session.execute(delete(Work).where(Work.is_emergency.is_(True)))
+        logger.info("Удалены аварийные работы и их потребности перед новым импортом")
+
+        for row_num, row in df.iterrows():
+            row_dict = row.to_dict()
+
+            try:
+                validated = WorkListImportRow(**row_dict)
+            except ValidationError as e:
+                logger.warning("Строка %d: %s", cast(int, row_num) + 2, e.errors()[0]["msg"])
+                stats["errors"] += 1
+                continue
+
+            # Ищем существующую работу с таким же кодом (может быть плановой)
+            stmt = select(Work).where(Work.kod_raboty == validated.kod_raboty)
+            work = session.scalar(stmt)
+
+            if work is None:
+                work = Work(
+                    kod_raboty=validated.kod_raboty,
+                    nazvanie=validated.nazvanie,
+                    tip_raboty=validated.tip_raboty,
+                    filial=validated.filial,
+                    podrazdelenie=validated.podrazdelenie,
+                    centr_zatrat=validated.centr_zatrat,
+                    zavod=validated.zavod,
+                    data_nachala=validated.data_nachala,
+                    data_okonchaniya=validated.data_okonchaniya,
+                    prioritet=validated.prioritet,
+                    status=validated.status,
+                    is_emergency=True,
+                )
+                session.add(work)
+                stats["created"] += 1
+            else:
+                # Обновляем существующую работу и помечаем как аварийную
+                work.is_emergency = True
+                if validated.nazvanie:
+                    work.nazvanie = validated.nazvanie
+                if validated.data_nachala:
+                    work.data_nachala = validated.data_nachala
+                if validated.data_okonchaniya:
+                    work.data_okonchaniya = validated.data_okonchaniya
+                if validated.filial:
+                    work.filial = validated.filial
+                if validated.zavod:
+                    work.zavod = validated.zavod
+                if validated.prioritet != 3:
+                    work.prioritet = validated.prioritet
+                if validated.status != "active":
+                    work.status = validated.status
+                stats["updated"] += 1
+
+            if (stats["created"] + stats["updated"]) % 500 == 0:
+                session.flush()
+
+        logger.info(
+            "Импорт перечня аварийных работ завершён: создано=%d, обновлено=%d, ошибок=%d",
+            stats["created"], stats["updated"], stats["errors"],
+        )
+
+    return stats
+
+
+# =============================================================================
+# Импорт потребностей аварийных работ
+# =============================================================================
+
+def import_emergency_requirements(file_path: Path, sheet_name: int | str = 0) -> dict[str, int]:
+    """
+    Импортировать потребности аварийных работ из Excel.
+
+    Формат файла совпадает с обычным файлом потребностей:
+        | Код работы | Группа материалов | Системный номер |
+        | Наименование | Ед.изм | Потребность | Прогнозная цена |
+
+    Работы должны быть загружены заранее через import_emergency_works.
+    Если работа не найдена или не является аварийной — строка пропускается.
+
+    При каждом вызове удаляются только требования аварийных работ (не плановых).
+
+    Args:
+        file_path:  Путь к Excel файлу с потребностями аварийных работ
+        sheet_name: Лист (по умолчанию первый)
+
+    Returns:
+        Статистика {"requirements": 50, "skipped": 2, "errors": 0}
+    """
+    logger.info("Импорт ПОТРЕБНОСТЕЙ аварийных работ из: %s", file_path)
+
     df = _read_excel(file_path, sheet_name)
     df = _rename_columns(df, REQUIREMENTS_COLUMN_MAP)
 
-    stats = {"works": 0, "requirements": 0, "errors": 0}
+    stats = {"requirements": 0, "skipped": 0, "errors": 0}
     errors: list[str] = []
 
     with get_session() as session:
@@ -487,94 +547,79 @@ def import_emergency_works(file_path: Path, sheet_name: int | str = 0) -> dict[s
         material_repo = MaterialRepository(session)
         req_repo = RequirementRepository(session)
 
-        # Удаляем только аварийные работы и их потребности —
-        # полный сброс базы уже выполнен командой import-requirements перед этим.
         from sqlalchemy import delete, select
 
-        emergency_work_ids = select(Work.id).where(Work.is_emergency == True)
+        # Удаляем только потребности аварийных работ
+        emergency_work_ids = select(Work.id).where(Work.is_emergency.is_(True))
         session.execute(delete(Requirement).where(Requirement.work_id.in_(emergency_work_ids)))
-        session.execute(delete(Work).where(Work.is_emergency == True))
-        logger.info("Удалены аварийные работы перед новым импортом")
+        logger.info("Удалены потребности аварийных работ перед новым импортом")
 
-        existing_works = work_repo.get_kod_map()
+        # Предзагружаем словари аварийных работ и материалов
+        all_works = work_repo.get_kod_map()                    # {kod_raboty: id}
+        emergency_ids = {
+            row.id
+            for row in session.execute(
+                select(Work.id).where(Work.is_emergency.is_(True))
+            ).all()
+        }
         existing_materials = material_repo.get_id_map()
-        new_works_in_session: set[str] = set()
         new_materials_in_session: set[str] = set()
 
         for row_num, row in df.iterrows():
             row_dict = row.to_dict()
 
             try:
-                validated = WorkImportRow(**row_dict)
+                validated = RequirementsImportRow(**row_dict)
             except ValidationError as e:
                 error_msg = f"Строка {cast(int, row_num) + 2}: {e.errors()[0]['msg']}"
                 errors.append(error_msg)
                 stats["errors"] += 1
-                logger.warning("Ошибка валидации аварийной работы | %s", error_msg)
+                logger.warning("Ошибка валидации | %s", error_msg)
                 continue
 
-            # Создаём работу с флагом is_emergency=True (это ключевое отличие!)
-            new_work_added = False  # флаг: создали ли новую работу В ЭТОЙ итерации
-            if (validated.kod_raboty not in existing_works
-                    and validated.kod_raboty not in new_works_in_session):
-                # Даты не передаём — они устанавливаются только через «Перечень работ»
-                work_repo.get_or_create(
-                    kod_raboty=validated.kod_raboty,
-                    tip_raboty=validated.tip_raboty,
-                    filial=validated.filial,
-                    podrazdelenie=validated.podrazdelenie,
-                    centr_zatrat=validated.centr_zatrat,
-                    zavod=validated.zavod,
-                    prioritet=validated.prioritet,
-                    status=validated.status,
-                    is_emergency=True,
+            work_id = all_works.get(validated.kod_raboty)
+            if work_id is None or work_id not in emergency_ids:
+                logger.warning(
+                    "Строка %d: Аварийная работа '%s' не найдена. Загрузите перечень аварийных работ первым.",
+                    cast(int, row_num) + 2, validated.kod_raboty,
                 )
-                new_works_in_session.add(validated.kod_raboty)
-                stats["works"] += 1
-                new_work_added = True  # работа только что добавлена, id ещё None
-            else:
-                # Если работа уже существует — помечаем как аварийную.
-                # get_or_create обновит флаг is_emergency у существующей записи.
-                # Новый объект не создаётся → flush не нужен.
-                work_repo.get_or_create(
-                    kod_raboty=validated.kod_raboty,
-                    is_emergency=True,
-                )
+                stats["skipped"] += 1
+                continue
 
-            new_material_added = False  # флаг: создали ли новый материал В ЭТОЙ итерации
+            new_material_added = False
             if (validated.sys_nomer_materiala not in existing_materials
                     and validated.sys_nomer_materiala not in new_materials_in_session):
                 material_repo.get_or_create(
                     sys_nomer=validated.sys_nomer_materiala,
                     naimenovanie=validated.naimenovanie_materiala,
                     ed_izm=validated.ed_izm,
+                    gruppa=validated.gruppa_materiala,
                 )
                 new_materials_in_session.add(validated.sys_nomer_materiala)
-                new_material_added = True  # материал только что добавлен, id ещё None
+                new_material_added = True
 
-            # Flush только если создали новый объект (нужен id) или каждые 500 строк
-            if new_work_added or new_material_added or stats["requirements"] % 500 == 0:
+            if new_material_added or stats["requirements"] % 500 == 0:
                 session.flush()
 
-            work = work_repo.get_by_kod(validated.kod_raboty)
             material = material_repo.get_by_sys_nomer(validated.sys_nomer_materiala)
+            if not material:
+                continue
 
-            if work and material:
-                req_repo.upsert(
-                    work_id=work.id,
-                    material_id=material.id,
-                    potrebnost=validated.potrebnost,
-                    prognosnaya_tsena=validated.prognosnaya_tsena,
-                )
-                stats["requirements"] += 1
+            req_repo.upsert(
+                work_id=work_id,
+                material_id=material.id,
+                potrebnost=validated.potrebnost,
+                prognosnaya_tsena=validated.prognosnaya_tsena,
+            )
+            stats["requirements"] += 1
 
         logger.info(
-            "Импорт АВАРИЙНЫХ работ завершён: работ=%d, потребностей=%d, ошибок=%d",
-            stats["works"], stats["requirements"], stats["errors"],
+            "Импорт потребностей аварийных работ завершён: потребностей=%d, пропущено=%d, ошибок=%d",
+            stats["requirements"], stats["skipped"], stats["errors"],
         )
 
     if errors:
-        logger.warning("Ошибки при импорте аварийных:\n%s", "\n".join(errors[:10]))
+        logger.warning("Ошибки при импорте:\n%s", "\n".join(errors[:10]))
 
     return stats
 
