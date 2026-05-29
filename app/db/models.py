@@ -101,7 +101,6 @@ class Work(Base):
     # Организационная структура
     filial: Mapped[str | None] = mapped_column(String(100))         # Филиал компании
     podrazdelenie: Mapped[str | None] = mapped_column(String(100))  # Подразделение
-    centr_zatrat: Mapped[str | None] = mapped_column(String(50))    # Центр затрат (CC)
     zavod: Mapped[str | None] = mapped_column(String(50))           # Код завода (Plant в SAP)
 
     # Временные рамки

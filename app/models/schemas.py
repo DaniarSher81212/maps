@@ -139,7 +139,6 @@ class WorkListImportRow(MapsBaseModel):
     tip_raboty: Optional[str] = None         # Тип: "ТО", "Ремонт", "Монтаж" и т.д.
     filial: Optional[str] = None             # Филиал компании
     podrazdelenie: Optional[str] = None      # Подразделение внутри филиала
-    centr_zatrat: Optional[str] = None       # Центр затрат (CC) из SAP
     zavod: Optional[str] = None              # Код завода (Plant) в SAP
     data_nachala: Optional[date] = None      # Дата начала работы (влияет на приоритет!)
     data_okonchaniya: Optional[date] = None  # Дата окончания / нужна к дате

@@ -73,7 +73,6 @@ class WorkRepository(BaseRepository[Work]):
         tip_raboty: Optional[str] = None,
         filial: Optional[str] = None,
         podrazdelenie: Optional[str] = None,
-        centr_zatrat: Optional[str] = None,
         zavod: Optional[str] = None,
         data_nachala=None,
         data_okonchaniya=None,
@@ -93,7 +92,6 @@ class WorkRepository(BaseRepository[Work]):
             tip_raboty:      Тип: "ТО", "Ремонт", "Монтаж" и т.д.
             filial:          Филиал компании
             podrazdelenie:   Подразделение
-            centr_zatrat:    Центр затрат
             zavod:           Код завода в SAP (Plant)
             data_nachala:    Дата начала работ (ГЛАВНЫЙ приоритет распределения)
             data_okonchaniya: Дата окончания работ
@@ -113,7 +111,6 @@ class WorkRepository(BaseRepository[Work]):
                 tip_raboty=tip_raboty,
                 filial=filial,
                 podrazdelenie=podrazdelenie,
-                centr_zatrat=centr_zatrat,
                 zavod=zavod,
                 data_nachala=data_nachala,
                 data_okonchaniya=data_okonchaniya,

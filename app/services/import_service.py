@@ -201,7 +201,6 @@ WORKS_COLUMN_MAP = {
     "Тип работы":           "tip_raboty",          # Категория: ТО, Ремонт, Монтаж...
     "Филиал":               "filial",              # Филиал компании
     "Подразделение":        "podrazdelenie",       # Подразделение внутри филиала
-    "Центр затрат":         "centr_zatrat",        # Центр затрат (CC) из SAP
     "Завод":                "zavod",               # Код завода (Plant) в SAP
     "Дата начала":          "data_nachala",        # Влияет на порядок распределения!
     "Дата окончания":       "data_okonchaniya",    # Нужна к дате (needed_by)
@@ -485,7 +484,6 @@ def import_emergency_works(file_path: Path, sheet_name: int | str = 0) -> dict[s
                     tip_raboty=validated.tip_raboty,
                     filial=validated.filial,
                     podrazdelenie=validated.podrazdelenie,
-                    centr_zatrat=validated.centr_zatrat,
                     zavod=validated.zavod,
                     data_nachala=validated.data_nachala,
                     data_okonchaniya=validated.data_okonchaniya,
@@ -1181,7 +1179,6 @@ def import_works(file_path: Path, sheet_name: int | str = 0) -> dict[str, int]:
                     tip_raboty=validated.tip_raboty,
                     filial=validated.filial,
                     podrazdelenie=validated.podrazdelenie,
-                    centr_zatrat=validated.centr_zatrat,
                     zavod=validated.zavod,
                     data_nachala=validated.data_nachala,
                     data_okonchaniya=validated.data_okonchaniya,
