@@ -50,25 +50,29 @@ def test_epsilon_comparison() -> None:
     assert normal_qty >= EPSILON
 
 
-def test_schemas_work_import_validation() -> None:
+def test_schemas_requirements_import_validation() -> None:
     """
-    Тест: Pydantic-схема правильно валидирует данные потребности.
+    Тест: Pydantic-схема RequirementsImportRow правильно валидирует данные потребности.
+
+    RequirementsImportRow — схема файла «Потребности».
+    Содержит только материальные данные: код работы + материал + количество.
+    Дат и статуса нет — они берутся из «Перечня работ» (WorkListImportRow).
     """
-    from app.models.schemas import WorkImportRow
+    from app.models.schemas import RequirementsImportRow
 
     # Корректные данные — должны пройти без ошибок
     valid_data = {
         "kod_raboty": "WO-001",
         "sys_nomer_materiala": "000000000010010001",
         "potrebnost": "100.5",
-        "prioritet": 2,
-        "filial": "Алматы",
-        "zavod": "KZ01",
+        "gruppa_materiala": "Кабели",
+        "naimenovanie_materiala": "Кабель ВВГ",
+        "ed_izm": "м",
     }
-    row = WorkImportRow(**valid_data)
+    row = RequirementsImportRow(**valid_data)
     assert row.kod_raboty == "WO-001"
     assert row.potrebnost == Decimal("100.5000")
-    assert row.prioritet == 2
+    assert row.gruppa_materiala == "Кабели"
 
 
 def test_schemas_invalid_quantity() -> None:
@@ -77,12 +81,12 @@ def test_schemas_invalid_quantity() -> None:
     """
     from pydantic import ValidationError
 
-    from app.models.schemas import WorkImportRow
+    from app.models.schemas import RequirementsImportRow
 
     import pytest  # noqa: PLC0415 — локальный импорт для удобства
 
     with pytest.raises(ValidationError):
-        WorkImportRow(
+        RequirementsImportRow(
             kod_raboty="WO-001",
             sys_nomer_materiala="000000000010010001",
             potrebnost="не_число",  # Некорректное значение
@@ -96,12 +100,12 @@ def test_schemas_negative_quantity_rejected() -> None:
     """
     from pydantic import ValidationError
 
-    from app.models.schemas import WorkImportRow
+    from app.models.schemas import RequirementsImportRow
 
     import pytest  # noqa: PLC0415
 
     with pytest.raises(ValidationError):
-        WorkImportRow(
+        RequirementsImportRow(
             kod_raboty="WO-001",
             sys_nomer_materiala="000000000010010001",
             potrebnost="-10",  # Отрицательное количество недопустимо
@@ -112,9 +116,9 @@ def test_schemas_date_validation() -> None:
     """
     Тест: Дата начала не может быть позже даты окончания.
 
-    Проверяем WorkListImportRow — именно эта схема используется при импорте
-    «Перечня работ» и содержит model_validator на даты.
-    WorkImportRow (файл потребностей) полей дат не имеет — даты приходят
+    Проверяем WorkListImportRow — эта схема используется при импорте «Перечня работ»
+    и содержит model_validator на даты.
+    RequirementsImportRow (файл потребностей) полей дат не имеет — даты приходят
     только через import-works (WorkListImportRow).
     """
     from pydantic import ValidationError
@@ -136,9 +140,9 @@ def test_schemas_sys_nomer_normalization() -> None:
     Тест: Системный номер нормализуется (убирается .0 в конце).
     Excel иногда сохраняет числа как float: 10010001 → "10010001.0"
     """
-    from app.models.schemas import WorkImportRow
+    from app.models.schemas import RequirementsImportRow
 
-    row = WorkImportRow(
+    row = RequirementsImportRow(
         kod_raboty="WO-001",
         sys_nomer_materiala="10010001.0",  # Как Excel может выгрузить
         potrebnost="100",

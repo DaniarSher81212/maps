@@ -868,19 +868,13 @@ def _get_source_requirements_df(session) -> pd.DataFrame:
     """
     Лист «Исх. Потребности» — все потребности до распределения.
 
-    Колонка «Наименование работы» убрана (используй лист «Обеспеченность»
-    для просмотра наименований работ).
+    Содержит только данные о материалах: что нужно и в каком количестве.
+    Даты, статус и приоритет работ — на листе «Исх. Перечень работ».
     """
     sql = text("""
         SELECT
-            w.is_emergency                               AS "Аварийная",
-            w.prioritet                                  AS "Приоритет",
             w.kod_raboty                                 AS "Код работы",
-            w.filial                                     AS "Филиал",
-            w.zavod                                      AS "Завод",
-            w.data_nachala                               AS "Дата начала",
-            w.data_okonchaniya                           AS "Дата окончания",
-            w.status                                     AS "Статус работы",
+            m.gruppa                                     AS "Группа материала",
             m.sys_nomer                                  AS "Системный номер",
             m.naimenovanie                               AS "Наименование материала",
             m.ed_izm                                     AS "Ед.изм",
@@ -891,21 +885,11 @@ def _get_source_requirements_df(session) -> pd.DataFrame:
         JOIN works     w ON r.work_id     = w.id
         JOIN materials m ON r.material_id = m.id
         ORDER BY
-            w.is_emergency DESC,
-            w.data_nachala ASC NULLS LAST,
-            w.prioritet ASC,
             w.kod_raboty,
             m.sys_nomer
     """)
     rows = session.execute(sql).fetchall()
-    df = _to_df(rows)
-    if df.empty:
-        return df
-    df["Аварийная"] = df["Аварийная"].apply(lambda x: "Да" if x else "")
-    for col in ["Дата начала", "Дата окончания"]:
-        if col in df.columns:
-            df[col] = df[col].apply(_fmt_date)
-    return df
+    return _to_df(rows)
 
 
 def _get_source_stock_df(session) -> pd.DataFrame:

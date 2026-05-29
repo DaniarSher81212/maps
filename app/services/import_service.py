@@ -84,7 +84,6 @@ from app.models.schemas import (
     RequirementsImportRow,
     StockImportRow,
     SupplyImportRow,
-    WorkImportRow,
     WorkListImportRow,
     WriteOffImportRow,
 )
