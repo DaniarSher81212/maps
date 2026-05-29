@@ -139,6 +139,12 @@
                             </h2>
                             <div id="imp-works" class="accordion-collapse collapse">
                                 <div class="accordion-body py-2">
+                                    <p class="text-muted small mb-2">
+                                        Колонки: <code>Код работы</code>, <code>Наименование работы</code>,
+                                        <code>Тип работы</code>, <code>Филиал</code>, <code>Подразделение</code>,
+                                        <code>Центр затрат</code>, <code>Завод</code>, <code>Дата начала</code>,
+                                        <code>Дата окончания</code>, <code>Приоритет</code>, <code>Статус</code>
+                                    </p>
                                     <input type="file" class="form-control form-control-sm" accept=".xlsx,.xls"
                                            onchange="uploadFile(this, '/api/import/works', 'res-works')">
                                     <div id="res-works" class="upload-result"></div>
@@ -228,6 +234,14 @@
                             </h2>
                             <div id="imp-stock" class="accordion-collapse collapse">
                                 <div class="accordion-body py-2">
+                                    <p class="text-muted small mb-2">
+                                        Колонки: <code>Код склада</code>, <code>Тип склада</code>,
+                                        <code>Филиал склада</code>, <code>Завод склада</code>,
+                                        <code>Системный номер</code>, <code>Наименование материала</code>,
+                                        <code>Ед.изм</code>, <code>Группа материала</code>,
+                                        <code>Номер партии</code>, <code>Количество</code>,
+                                        <code>Стоимость за ед</code>, <code>Дата поступления</code>
+                                    </p>
                                     <input type="file" class="form-control form-control-sm" accept=".xlsx,.xls"
                                            onchange="uploadFile(this, '/api/import/stock', 'res-stock')">
                                     <div id="res-stock" class="upload-result"></div>
@@ -246,6 +260,13 @@
                             </h2>
                             <div id="imp-sup" class="accordion-collapse collapse">
                                 <div class="accordion-body py-2">
+                                    <p class="text-muted small mb-2">
+                                        Колонки: <code>Договор</code>, <code>Поставщик</code>,
+                                        <code>Код склада</code>, <code>Филиал</code>, <code>Завод</code>,
+                                        <code>Системный номер</code>, <code>Наименование материала</code>,
+                                        <code>Ед.изм</code>, <code>Дата поставки</code>,
+                                        <code>Количество</code>, <code>Стоимость за ед</code>, <code>Статус</code>
+                                    </p>
                                     <input type="file" class="form-control form-control-sm" accept=".xlsx,.xls"
                                            onchange="uploadFile(this, '/api/import/supplies', 'res-sup')">
                                     <div id="res-sup" class="upload-result"></div>
@@ -264,6 +285,12 @@
                             </h2>
                             <div id="imp-wo" class="accordion-collapse collapse">
                                 <div class="accordion-body py-2">
+                                    <p class="text-muted small mb-2">
+                                        Колонки: <code>Код работы</code>, <code>Системный номер</code>,
+                                        <code>Наименование материала</code>, <code>Ед.изм</code>,
+                                        <code>Количество</code>, <code>Стоимость за ед</code>,
+                                        <code>Сумма</code>, <code>Номер документа</code>, <code>Дата списания</code>
+                                    </p>
                                     <input type="file" class="form-control form-control-sm" accept=".xlsx,.xls"
                                            onchange="uploadFile(this, '/api/import/writeoffs', 'res-wo')">
                                     <div id="res-wo" class="upload-result"></div>
@@ -282,6 +309,12 @@
                             </h2>
                             <div id="imp-iss" class="accordion-collapse collapse">
                                 <div class="accordion-body py-2">
+                                    <p class="text-muted small mb-2">
+                                        Колонки: <code>Код работы</code>, <code>Системный номер</code>,
+                                        <code>Наименование материала</code>, <code>Ед.изм</code>,
+                                        <code>Количество</code>, <code>Стоимость за ед</code>,
+                                        <code>Сумма</code>, <code>Код склада</code>, <code>Дата выдачи</code>
+                                    </p>
                                     <input type="file" class="form-control form-control-sm" accept=".xlsx,.xls"
                                            onchange="uploadFile(this, '/api/import/issued', 'res-iss')">
                                     <div id="res-iss" class="upload-result"></div>
