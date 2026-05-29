@@ -44,7 +44,19 @@
         <i class="bi bi-boxes me-2"></i>MAPS
         <small class="text-secondary fw-normal fs-6 ms-2">Material Allocation & Planning System</small>
     </span>
-    <span class="text-secondary small" id="server-time"></span>
+    <div class="d-flex align-items-center gap-3">
+        <span class="text-secondary small" id="server-time"></span>
+        {% if username %}
+        <span class="text-secondary small">
+            <i class="bi bi-person-circle me-1"></i>{{ username }}
+        </span>
+        {% endif %}
+        <form method="POST" action="/logout" class="mb-0">
+            <button type="submit" class="btn btn-outline-secondary btn-sm">
+                <i class="bi bi-box-arrow-right me-1"></i>Выйти
+            </button>
+        </form>
+    </div>
 </nav>
 
 <div class="container-fluid px-4">

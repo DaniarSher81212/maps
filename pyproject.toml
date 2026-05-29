@@ -52,6 +52,7 @@ dependencies = [
     "uvicorn[standard]>=0.29.0", # ASGI-сервер для запуска FastAPI
     "jinja2>=3.1.0",             # Шаблонизатор HTML для дашборда
     "python-multipart>=0.0.9",   # Поддержка загрузки файлов (multipart/form-data)
+    "itsdangerous>=2.1.0",       # Подписанные куки для сессий (SessionMiddleware)
 
     # --- AI ---
     "anthropic>=0.40.0",  # Claude API для AI-анализа дефицита

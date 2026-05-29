@@ -52,6 +52,14 @@ class Settings(BaseSettings):
     data_dir: str = Field(default="data", description="Папка с Excel-файлами")
     export_dir: str = Field(default="data/exports", description="Папка для экспорта результатов")
 
+    # --- Аутентификация дашборда ---
+    # Секретный ключ для подписи сессионных кук (SessionMiddleware).
+    # Должен быть длинным случайным значением — менять при компрометации.
+    secret_key: str = Field(default="change-me-in-production", description="Секрет для сессий")
+    # Логин и пароль для входа в дашборд
+    maps_username: str = Field(default="admin", description="Логин дашборда")
+    maps_password: str = Field(default="***REMOVED-PASSWORD***", description="Пароль дашборда")
+
     # --- AI-анализ ---
     # Ключ Anthropic API для функции объяснения дефицита.
     # None если не задан — AI-анализ просто недоступен, остальное работает.
