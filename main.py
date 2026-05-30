@@ -529,7 +529,9 @@ def allocate(
     with console.status("Выполняется распределение..."):
         try:
             with get_session() as session:
-                engine = AllocationEngine(session, session_id=session_id)
+                from app.api.routes.settings import get_or_create_settings
+                planning_year = get_or_create_settings(session).planning_year
+                engine = AllocationEngine(session, session_id=session_id, planning_year=planning_year)
                 result_session = engine.run()
                 # Считываем атрибуты пока сессия ещё открыта —
                 # после выхода из блока объект отсоединяется от сессии

@@ -116,24 +116,30 @@ REQUIREMENTS_COLUMN_MAP = {
     "Наименование":         "naimenovanie_materiala",
     "Наименование материала": "naimenovanie_materiala",  # альтернативный заголовок
     "Ед.изм":               "ed_izm",
+    "Ед. изм.":             "ed_izm",                   # альтернативный заголовок (SAP-выгрузка)
     "Потребность":          "potrebnost",
     "Прогнозная цена":      "prognosnaya_tsena",
 }
 
 # Колонки для файла складских остатков
 STOCK_COLUMN_MAP = {
-    "Код склада":           "kod_sklada",
-    "Тип склада":           "tip_sklada",
-    "Филиал склада":        "filial_sklada",
-    "Завод склада":         "zavod_sklada",
-    "Системный номер":      "sys_nomer_materiala",
+    "Код склада":             "kod_sklada",
+    "Тип склада":             "tip_sklada",
+    "Филиал склада":          "filial_sklada",
+    "Филиал":                 "filial_sklada",           # альтернативный заголовок (SAP-выгрузка)
+    "Завод склада":           "zavod_sklada",
+    "Системный номер":        "sys_nomer_materiala",
     "Наименование материала": "naimenovanie_materiala",
-    "Ед.изм":               "ed_izm",
-    "Группа материала":     "gruppa_materiala",
-    "Номер партии":         "nomer_partii",
-    "Количество":           "kolichestvo",
-    "Стоимость за ед":      "stoimost_za_ed",
-    "Дата поступления":     "data_postupleniya",
+    "Наименование материал":  "naimenovanie_materiala",  # альтернативный заголовок (SAP-выгрузка)
+    "Ед.изм":                 "ed_izm",
+    "Ед. изм.":               "ed_izm",                  # альтернативный заголовок (SAP-выгрузка)
+    "Группа материала":       "gruppa_materiala",
+    "Группа материалов":      "gruppa_materiala",        # альтернативный заголовок (SAP-выгрузка)
+    "Номер партии":           "nomer_partii",
+    "Количество":             "kolichestvo",
+    "Стоимость за ед":        "stoimost_za_ed",
+    "Стоимость за ед.":       "stoimost_za_ed",          # альтернативный заголовок (SAP-выгрузка)
+    "Дата поступления":       "data_postupleniya",
 }
 
 # Колонки для файла поставок
@@ -154,15 +160,17 @@ SUPPLY_COLUMN_MAP = {
 
 # Колонки для файла фактических списаний (Слой 1)
 WRITEOFF_COLUMN_MAP = {
-    "Код работы":           "kod_raboty",
-    "Системный номер":      "sys_nomer_materiala",
+    "Код работы":             "kod_raboty",
+    "Системный номер":        "sys_nomer_materiala",
     "Наименование материала": "naimenovanie_materiala",
-    "Ед.изм":               "ed_izm",
-    "Количество":           "kolichestvo",
-    "Стоимость за ед":      "stoimost_za_ed",
-    "Сумма":                "summa",
-    "Номер документа":      "nomer_dokumenta",
-    "Дата списания":        "data_spisaniya",
+    "Ед.изм":                 "ed_izm",
+    "Ед. изм.":               "ed_izm",                  # альтернативный заголовок (SAP-выгрузка)
+    "Количество":             "kolichestvo",
+    "Стоимость за ед":        "stoimost_za_ed",
+    "Стоимость за ед.":       "stoimost_za_ed",          # альтернативный заголовок (SAP-выгрузка)
+    "Сумма":                  "summa",
+    "Номер документа":        "nomer_dokumenta",
+    "Дата списания":          "data_spisaniya",
 }
 
 # Колонки для файла «Выдано не списано» (Слой 2)
@@ -197,6 +205,7 @@ APPROVED_TRANSFERS_COLUMN_MAP = {
 # Загружается командами: maps import-works / maps import-emergency
 WORKS_COLUMN_MAP = {
     "Код работы":           "kod_raboty",         # Обязательная колонка — ключ записи
+    "Центр затрат":         "kod_raboty",         # альтернативный заголовок (SAP-выгрузка)
     "Наименование работы":  "nazvanie",            # Человекочитаемое описание работы
     "Тип работы":           "tip_raboty",          # Категория: ТО, Ремонт, Монтаж...
     "Филиал":               "filial",              # Филиал компании
@@ -452,17 +461,10 @@ def import_emergency_works(file_path: Path, sheet_name: int | str = 0) -> dict[s
     df = _read_excel(file_path, sheet_name)
     df = _rename_columns(df, WORKS_COLUMN_MAP)
 
-    stats = {"created": 0, "updated": 0, "errors": 0}
+    stats = {"created": 0, "errors": 0}
 
     with get_session() as session:
-        from sqlalchemy import delete, select
-
-        # Удаляем потребности аварийных работ перед переимпортом самих работ
-        emergency_work_ids = select(Work.id).where(Work.is_emergency.is_(True))
-        session.execute(delete(Requirement).where(Requirement.work_id.in_(emergency_work_ids)))
-        session.execute(delete(Work).where(Work.is_emergency.is_(True)))
-        logger.info("Удалены аварийные работы и их потребности перед новым импортом")
-
+        # База уже очищена шагом import_works — просто вставляем аварийные работы
         for row_num, row in df.iterrows():
             row_dict = row.to_dict()
 
@@ -473,51 +475,28 @@ def import_emergency_works(file_path: Path, sheet_name: int | str = 0) -> dict[s
                 stats["errors"] += 1
                 continue
 
-            # Ищем существующую работу с таким же кодом (может быть плановой)
-            stmt = select(Work).where(Work.kod_raboty == validated.kod_raboty)
-            work = session.scalar(stmt)
+            work = Work(
+                kod_raboty=validated.kod_raboty,
+                nazvanie=validated.nazvanie,
+                tip_raboty=validated.tip_raboty,
+                filial=validated.filial,
+                podrazdelenie=validated.podrazdelenie,
+                zavod=validated.zavod,
+                data_nachala=validated.data_nachala,
+                data_okonchaniya=validated.data_okonchaniya,
+                prioritet=validated.prioritet,
+                status=validated.status,
+                is_emergency=True,
+            )
+            session.add(work)
+            stats["created"] += 1
 
-            if work is None:
-                work = Work(
-                    kod_raboty=validated.kod_raboty,
-                    nazvanie=validated.nazvanie,
-                    tip_raboty=validated.tip_raboty,
-                    filial=validated.filial,
-                    podrazdelenie=validated.podrazdelenie,
-                    zavod=validated.zavod,
-                    data_nachala=validated.data_nachala,
-                    data_okonchaniya=validated.data_okonchaniya,
-                    prioritet=validated.prioritet,
-                    status=validated.status,
-                    is_emergency=True,
-                )
-                session.add(work)
-                stats["created"] += 1
-            else:
-                # Обновляем существующую работу и помечаем как аварийную
-                work.is_emergency = True
-                if validated.nazvanie:
-                    work.nazvanie = validated.nazvanie
-                if validated.data_nachala:
-                    work.data_nachala = validated.data_nachala
-                if validated.data_okonchaniya:
-                    work.data_okonchaniya = validated.data_okonchaniya
-                if validated.filial:
-                    work.filial = validated.filial
-                if validated.zavod:
-                    work.zavod = validated.zavod
-                if validated.prioritet != 3:
-                    work.prioritet = validated.prioritet
-                if validated.status != "active":
-                    work.status = validated.status
-                stats["updated"] += 1
-
-            if (stats["created"] + stats["updated"]) % 500 == 0:
+            if stats["created"] % 500 == 0:
                 session.flush()
 
         logger.info(
-            "Импорт перечня аварийных работ завершён: создано=%d, обновлено=%d, ошибок=%d",
-            stats["created"], stats["updated"], stats["errors"],
+            "Импорт перечня аварийных работ завершён: создано=%d, ошибок=%d",
+            stats["created"], stats["errors"],
         )
 
     return stats
@@ -1105,27 +1084,26 @@ def import_issued_not_written_off(file_path: Path, sheet_name: int | str = 0) ->
 
 def import_works(file_path: Path, sheet_name: int | str = 0) -> dict[str, int]:
     """
-    Импортировать перечень работ с наименованиями из Excel.
+    Импортировать перечень работ из Excel. Первый шаг полного цикла импорта.
 
-    Что делает эта функция?
-        Загружает мастер-данные о работах: наименование, даты, оргструктуру.
-        Если работа уже существует в БД — обновляет её поля (upsert по kod_raboty).
-        Если работы нет — создаёт новую запись.
+    Логика «чистого листа»:
+        Перед каждым циклом планирования база очищается полностью:
+        удаляются все операционные данные и все работы, затем загружаются
+        плановые работы из файла как новые записи.
 
-    Когда запускать?
-        Рекомендуется ДО import-requirements, чтобы при создании работ через
-        import-requirements они уже имели наименования из перечня.
-        Но можно и ПОСЛЕ: функция обновит существующие работы.
+        Это гарантирует, что статусы, даты и приоритеты в БД всегда точно
+        соответствуют тому, что передано в файле — без накопленных остатков
+        от предыдущих циклов.
 
-    Что НЕ делает:
-        Не удаляет существующие работы — только добавляет/обновляет.
-        Не затрагивает потребности, складские остатки, поставки и другие данные.
-
-    Логика upsert (обновления):
-        Поля обновляются только если в файле передано непустое значение.
-        Это позволяет загружать неполные файлы — пустые поля не затрут существующие данные.
-        Приоритет НЕ обновляется если он равен 3 (значение по умолчанию).
-        Статус НЕ обновляется если он равен "active" (значение по умолчанию).
+    Порядок полного цикла импорта:
+        1. import-works            ← вы здесь (сброс всего + плановые работы)
+        2. import-emergency        ← аварийные работы
+        3. import-requirements     ← потребности плановых работ
+        4. import-emergency-req    ← потребности аварийных работ (API)
+        5. import-stock            ← складские остатки
+        6. import-supplies         ← поставки
+        7. import-writeoffs        ← фактические списания
+        8. import-issued           ← выдано не списано
 
     Формат файла:
         | Код работы | Наименование работы | Дата начала | Дата окончания |
@@ -1136,109 +1114,65 @@ def import_works(file_path: Path, sheet_name: int | str = 0) -> dict[str, int]:
         sheet_name: Лист (0 = первый лист, можно передать имя листа)
 
     Returns:
-        Статистика {"created": 30, "updated": 20, "errors": 0}
+        Статистика {"created": 455, "errors": 0}
     """
-    # Читаем файл и переименовываем колонки согласно маппингу
     df = _read_excel(file_path, sheet_name)
     df = _rename_columns(df, WORKS_COLUMN_MAP)
 
-    # Счётчики для итоговой статистики
-    stats = {"created": 0, "updated": 0, "errors": 0}
+    stats = {"created": 0, "errors": 0}
 
     with get_session() as session:
-        from sqlalchemy import select
+        from sqlalchemy import delete
+
+        # Полный сброс базы перед новым циклом планирования.
+        # Порядок важен: сначала удаляем дочерние таблицы (FK → works),
+        # затем сами работы. Склады (warehouses) не трогаем — они справочник.
+        session.execute(delete(StockMovement))
+        session.execute(delete(AllocationResult))
+        session.execute(delete(DeficitRecord))
+        session.execute(delete(AllocationSession))
+        session.execute(delete(WriteOff))
+        session.execute(delete(IssuedNotWrittenOff))
+        session.execute(delete(SupplyLine))
+        session.execute(delete(Supply))
+        session.execute(delete(StockBatch))
+        session.execute(delete(Requirement))
+        session.execute(delete(Work))
+        logger.info("Полный сброс базы перед новым циклом планирования")
 
         for row_num, row in df.iterrows():
-            # Преобразуем строку DataFrame в обычный Python-словарь
             row_dict = row.to_dict()
 
-            # --- Валидация строки через Pydantic ---
-            # WorkListImportRow проверяет: обязательные поля заполнены,
-            # дата начала не позже даты окончания, приоритет в диапазоне 1-3.
             try:
                 validated = WorkListImportRow(**row_dict)
             except ValidationError as e:
-                # Записываем только первую (самую понятную) ошибку из списка
                 logger.warning("Строка %d: %s", cast(int, row_num) + 2, e.errors()[0]["msg"])
                 stats["errors"] += 1
-                continue  # Пропускаем строку с ошибкой и переходим к следующей
+                continue
 
-            # --- Ищем существующую работу по коду ---
-            # SELECT * FROM works WHERE kod_raboty = validated.kod_raboty
-            stmt = select(Work).where(Work.kod_raboty == validated.kod_raboty)
-            work = session.scalar(stmt)  # scalar() вернёт объект Work или None
+            # Создаём работу из файла как есть — база пуста, дублей быть не может
+            work = Work(
+                kod_raboty=validated.kod_raboty,
+                nazvanie=validated.nazvanie,
+                tip_raboty=validated.tip_raboty,
+                filial=validated.filial,
+                podrazdelenie=validated.podrazdelenie,
+                zavod=validated.zavod,
+                data_nachala=validated.data_nachala,
+                data_okonchaniya=validated.data_okonchaniya,
+                prioritet=validated.prioritet,
+                status=validated.status,
+                is_emergency=False,
+            )
+            session.add(work)
+            stats["created"] += 1
 
-            if work is None:
-                # --- Создаём новую работу ---
-                # Работа не найдена в БД — создаём с данными из файла.
-                # is_emergency=False: перечень работ не содержит аварийных
-                # (аварийные загружаются отдельно через import-emergency).
-                work = Work(
-                    kod_raboty=validated.kod_raboty,
-                    nazvanie=validated.nazvanie,
-                    tip_raboty=validated.tip_raboty,
-                    filial=validated.filial,
-                    podrazdelenie=validated.podrazdelenie,
-                    zavod=validated.zavod,
-                    data_nachala=validated.data_nachala,
-                    data_okonchaniya=validated.data_okonchaniya,
-                    prioritet=validated.prioritet,
-                    status=validated.status,
-                    is_emergency=False,  # Перечень работ — не аварийные
-                )
-                session.add(work)
-                stats["created"] += 1
-
-            else:
-                # --- Обновляем существующую работу ---
-                # Работа уже есть в БД (например, была создана через import-requirements).
-                # Обновляем только непустые поля: не затираем данные если в файле пусто.
-
-                if validated.nazvanie:
-                    # Обновляем наименование если в файле оно указано
-                    work.nazvanie = validated.nazvanie
-
-                if validated.data_nachala:
-                    # Обновляем дату начала если в файле указана
-                    work.data_nachala = validated.data_nachala
-
-                if validated.data_okonchaniya:
-                    # Обновляем дату окончания если в файле указана
-                    work.data_okonchaniya = validated.data_okonchaniya
-
-                if validated.filial:
-                    # Обновляем филиал если указан
-                    work.filial = validated.filial
-
-                if validated.zavod:
-                    # Обновляем завод если указан
-                    work.zavod = validated.zavod
-
-                if validated.tip_raboty:
-                    # Обновляем тип работы если указан
-                    work.tip_raboty = validated.tip_raboty
-
-                if validated.prioritet != 3:
-                    # Обновляем приоритет только если он отличается от дефолтного значения (3).
-                    # Иначе непоставленный приоритет в файле перезапишет реальный из потребностей.
-                    work.prioritet = validated.prioritet
-
-                if validated.status != "active":
-                    # Обновляем статус только если он отличается от дефолта "active".
-                    # Иначе пустой статус в файле сбросит "completed" или "cancelled".
-                    work.status = validated.status
-
-                stats["updated"] += 1
-
-            # Периодический flush: каждые 500 записей отправляем данные в PostgreSQL.
-            # Это необходимо для освобождения памяти при больших файлах.
-            # Транзакция ещё не завершена — коммит произойдёт при выходе из get_session().
-            if (stats["created"] + stats["updated"]) % 500 == 0:
+            if stats["created"] % 500 == 0:
                 session.flush()
 
         logger.info(
-            "Импорт перечня работ завершён: создано=%d, обновлено=%d, ошибок=%d",
-            stats["created"], stats["updated"], stats["errors"],
+            "Импорт перечня работ завершён: создано=%d, ошибок=%d",
+            stats["created"], stats["errors"],
         )
 
     return stats

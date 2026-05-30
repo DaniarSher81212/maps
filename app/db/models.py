@@ -55,6 +55,7 @@ from sqlalchemy import (
     DateTime,
     ForeignKey,
     Index,
+    Integer,
     Numeric,
     String,
     Text,
@@ -634,3 +635,37 @@ class DeficitRecord(Base):
             f"<Deficit work={self.work_id} mat={self.material_id} "
             f"qty={self.deficit_qty} needed_by={self.needed_by}>"
         )
+
+
+class SystemSettings(Base):
+    """
+    Таблица system_settings — глобальные настройки системы (одна строка, id=1).
+
+    Что хранится здесь?
+        Параметры, которые пользователь задаёт через дашборд и которые
+        влияют на работу алгоритма распределения.
+
+    Почему одна строка?
+        Настройки системы — это единственный набор параметров, не привязанный
+        к конкретной работе или материалу. Паттерн «singleton-строка» проще,
+        чем таблица ключ-значение.
+
+    Как используется planning_year?
+        Алгоритм считает работу «завершённой по дате» если её дата окончания
+        меньше 1 января года планирования. Это позволяет корректно анализировать
+        исторические данные (например, данные за 2025 год при запуске в 2026).
+    """
+    __tablename__ = "system_settings"
+
+    # Всегда одна запись с id=1 (синглтон)
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, default=1)
+
+    # Год планирования — определяет «точку отсчёта» для алгоритма
+    planning_year: Mapped[int] = mapped_column(Integer, default=2025)
+
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime, server_default=func.now(), onupdate=func.now()
+    )
+
+    def __repr__(self) -> str:
+        return f"<SystemSettings planning_year={self.planning_year}>"

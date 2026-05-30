@@ -16,6 +16,7 @@ POST /api/allocate — запустить распределение в фоне
 from fastapi import APIRouter, BackgroundTasks
 
 from app.allocation.engine import AllocationEngine
+from app.api.routes.settings import get_or_create_settings
 from app.db.database import get_session
 
 router = APIRouter()
@@ -25,14 +26,13 @@ def _run_allocation() -> None:
     """
     Функция, запускаемая в фоновой задаче FastAPI.
 
-    Создаёт собственную сессию БД (не использует сессию HTTP-запроса,
-    т.к. HTTP-запрос уже завершён к этому моменту).
-
-    get_session() автоматически делает commit при успехе
-    и rollback при ошибке — сессия корректно закрывается в любом случае.
+    Читает год планирования из таблицы system_settings и передаёт его
+    в движок распределения — это определяет, какие работы считаются
+    завершёнными «по дате» и не требуют закупки материалов.
     """
     with get_session() as session:
-        engine = AllocationEngine(session)
+        planning_year = get_or_create_settings(session).planning_year
+        engine = AllocationEngine(session, planning_year=planning_year)
         engine.run()
 
 

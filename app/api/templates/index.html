@@ -98,6 +98,20 @@
                         списание → выдано → склад → поставки → дефицит.
                         Предыдущий результат заменяется новым.
                     </p>
+                    <!-- Год планирования -->
+                    <div class="mb-3 d-flex align-items-center gap-2">
+                        <label class="form-label mb-0 text-muted small" style="white-space:nowrap">
+                            <i class="bi bi-calendar3 me-1"></i>Год планирования:
+                        </label>
+                        <input type="number" id="planning-year" class="form-control form-control-sm"
+                               style="width:100px" min="2000" max="2099">
+                        <button class="btn btn-sm btn-outline-secondary" onclick="savePlanningYear()">
+                            Сохранить
+                        </button>
+                        <span id="planning-year-saved" class="text-success small d-none">
+                            <i class="bi bi-check-lg"></i> Сохранено
+                        </span>
+                    </div>
                     <button id="btn-allocate" class="btn btn-success btn-allocate" onclick="runAllocation()">
                         <i class="bi bi-lightning-charge-fill me-2"></i>Запустить распределение
                     </button>
@@ -436,8 +450,9 @@
 // Инициализация страницы
 // ============================================================================
 document.addEventListener("DOMContentLoaded", () => {
-    loadStatus();    // Загрузить статистику и текущую сессию
-    updateTime();    // Показывать текущее время в навбаре
+    loadStatus();         // Загрузить статистику и текущую сессию
+    loadPlanningYear();   // Загрузить год планирования из настроек
+    updateTime();         // Показывать текущее время в навбаре
     setInterval(updateTime, 1000);
 });
 
@@ -566,6 +581,43 @@ async function runAllocation() {
         btn.disabled = false;
         document.getElementById("allocate-status").classList.add("d-none");
         alert("Ошибка при запуске: " + e.message);
+    }
+}
+
+// ============================================================================
+// Год планирования (GET/POST /api/settings)
+// ============================================================================
+
+// Загрузить год планирования из БД и заполнить поле на странице
+async function loadPlanningYear() {
+    try {
+        const r = await fetch("/api/settings");
+        const d = await r.json();
+        document.getElementById("planning-year").value = d.planning_year;
+    } catch(e) {
+        console.warn("Не удалось загрузить год планирования:", e);
+    }
+}
+
+// Сохранить выбранный год планирования в БД
+async function savePlanningYear() {
+    const year = parseInt(document.getElementById("planning-year").value);
+    if (!year || year < 2000 || year > 2099) {
+        alert("Введите корректный год (2000–2099)");
+        return;
+    }
+    try {
+        await fetch("/api/settings", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ planning_year: year })
+        });
+        // Показываем «Сохранено» на 2 секунды
+        const saved = document.getElementById("planning-year-saved");
+        saved.classList.remove("d-none");
+        setTimeout(() => saved.classList.add("d-none"), 2000);
+    } catch(e) {
+        alert("Ошибка при сохранении: " + e.message);
     }
 }
 

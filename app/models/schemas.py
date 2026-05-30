@@ -75,8 +75,8 @@ def _parse_date_ru(v: object) -> Optional[date]:
         # pandas Timestamp или datetime → date
         return getattr(v, "date")()
     s = str(v).strip()
-    # Пробуем русский формат ДД.ММ.ГГГГ
-    for fmt in ("%d.%m.%Y", "%Y-%m-%d", "%d/%m/%Y"):
+    # Пробуем русский формат ДД.ММ.ГГГГ и ISO-варианты (с временем и без)
+    for fmt in ("%d.%m.%Y", "%Y-%m-%d", "%d/%m/%Y", "%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S"):
         try:
             return datetime.strptime(s, fmt).date()
         except ValueError:

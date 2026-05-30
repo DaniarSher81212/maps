@@ -37,6 +37,7 @@ from fastapi.templating import Jinja2Templates
 from starlette.middleware.sessions import SessionMiddleware
 
 from app.api.routes import ai, allocation, auth, export, import_, status
+from app.api.routes import settings as settings_router
 from app.core.config import settings
 
 # Путь к папке с HTML-шаблонами (рядом с этим файлом)
@@ -76,6 +77,7 @@ app.include_router(auth.router)
 
 # Остальные роутеры — все под /api/...
 app.include_router(status.router, prefix="/api", tags=["Статус"])
+app.include_router(settings_router.router, prefix="/api", tags=["Настройки"])
 app.include_router(allocation.router, prefix="/api", tags=["Распределение"])
 app.include_router(import_.router, prefix="/api", tags=["Импорт"])
 app.include_router(export.router, prefix="/api", tags=["Экспорт"])

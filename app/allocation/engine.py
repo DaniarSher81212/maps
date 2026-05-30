@@ -200,18 +200,30 @@ class AllocationEngine:
             result_session = engine.run()
     """
 
-    def __init__(self, session: Session, session_id: Optional[str] = None) -> None:
+    def __init__(
+        self,
+        session: Session,
+        session_id: Optional[str] = None,
+        planning_year: Optional[int] = None,
+    ) -> None:
         """
         Инициализация движка.
 
         Args:
-            session:    Сессия SQLAlchemy (транзакция к PostgreSQL)
-            session_id: ID сессии распределения. Если None — генерируется автоматически.
-                        Формат по умолчанию: "20260523_143055_a1b2c"
+            session:       Сессия SQLAlchemy (транзакция к PostgreSQL)
+            session_id:    ID сессии распределения. Если None — генерируется автоматически.
+                           Формат по умолчанию: "20260523_143055_a1b2c"
+            planning_year: Год планирования. Определяет «точку отсчёта» для проверки
+                           завершённости работ по дате. Работа считается завершённой
+                           если её дата окончания < 1 января года планирования.
+                           Если None — берётся текущий год (date.today().year).
         """
         self.session = session
-        # ID сессии — уникальный идентификатор этого запуска
         self.session_id = session_id or f"{datetime.now():%Y%m%d_%H%M%S}_{uuid.uuid4().hex[:5]}"
+        # Первый день года планирования — граница «завершённости по дате».
+        # Работы, закончившиеся до этой даты, считаются завершёнными.
+        _year = planning_year or date.today().year
+        self.planning_cutoff = date(_year, 1, 1)
 
         # Репозитории — объекты для работы с разными таблицами БД
         self.req_repo = RequirementRepository(session)
@@ -398,7 +410,7 @@ class AllocationEngine:
         is_completed = (
             work.status in ("completed", "завершена")
             or (work.data_okonchaniya is not None
-                and work.data_okonchaniya < date.today())
+                and work.data_okonchaniya < self.planning_cutoff)
         )
 
         if is_completed:
