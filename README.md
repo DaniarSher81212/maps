@@ -3,7 +3,7 @@
 **MAPS** — система автоматического распределения строительных материалов на работы.  
 Система определяет, каким работам хватает материалов, а каким — нет, используя пятислойный алгоритм приоритизации. Результат — Excel-отчёт с полным разбором покрытия и дефицита.
 
-Версия: **3.1.0** | Дата: **2026-05-29** | Python **3.11+** | PostgreSQL **15+**
+Версия: **3.1.0** | Дата: **2026-05-30** | Python **3.11+** | PostgreSQL **15+**
 
 ---
 
@@ -129,11 +129,13 @@ PythonProject/
 │   ├── api/                      # FastAPI веб-приложение
 │   │   ├── main.py               # Точка входа FastAPI, регистрация роутеров
 │   │   ├── routes/
+│   │   │   ├── auth.py           # GET/POST /login, POST /logout
 │   │   │   ├── status.py         # GET /api/status
+│   │   │   ├── settings.py       # GET/POST /api/settings (год планирования)
 │   │   │   ├── allocation.py     # POST /api/allocate
-│   │   │   ├── import_.py        # POST /api/import/* (8 типов файлов)
-│   │   │   ├── export.py         # GET /api/export/current
-│   │   │   └── ai.py             # POST /api/ai/explain
+│   │   │   ├── import_.py        # POST /api/import/* (9 типов файлов)
+│   │   │   ├── export.py         # GET /api/export/{session_id}
+│   │   │   └── ai.py             # GET /api/ai/deficits, POST /api/ai/explain
 │   │   └── templates/
 │   │       └── index.html        # Bootstrap 5 дашборд (SPA на fetch API)
 │   │
@@ -153,14 +155,26 @@ PythonProject/
 │   │   └── material_repository.py # Запросы: остатки по складам
 │   │
 │   └── services/
-│       ├── import_service.py     # Импорт Excel → БД (6 типов)
-│       └── export_service.py     # Экспорт результатов → Excel
+│       ├── import_service.py     # Импорт Excel → БД (9 типов)
+│       └── export_service.py     # Экспорт результатов → Excel (до 16 листов)
 │
 ├── deploy/                       # Скрипты деплоя на Oracle Cloud
 │   ├── setup.sh                  # Установка всего на сервере одной командой
-│   ├── maps.service              # systemd-юнит (автозапуск)
-│   ├── tunnel.sh                 # Cloudflare Quick Tunnel
+│   ├── maps.service              # systemd-юнит MAPS (автозапуск)
+│   ├── tunnel.sh                 # Cloudflare Quick Tunnel (разовый запуск)
 │   └── README.md                 # Инструкция деплоя
+│
+├── docs/                         # Документация
+│   ├── ИНСТРУКЦИЯ.md             # Руководство администратора
+│   ├── РУКОВОДСТВО_ПОЛЬЗОВАТЕЛЯ.md  # Руководство конечного пользователя
+│   ├── ОПИСАНИЕ_ПРОЕКТА.md       # Архитектура и детали реализации
+│   ├── ТЗ_ПРЕЗЕНТАЦИЯ.md         # Техническое задание
+│   ├── diagrams/                 # PNG-диаграммы (Graphviz)
+│   └── generate_pdf.py           # Генерация PDF из Markdown
+│
+├── scripts/                      # Вспомогательные скрипты
+│   ├── generate_sample_data.py   # Генерация тестовых данных
+│   └── generate_test_scenarios.py # Сценарии для тестирования
 │
 ├── migrations/                   # Alembic миграции базы данных
 │   └── versions/                 # SQL-скрипты изменений схемы
@@ -362,21 +376,27 @@ curl -X POST http://localhost:8000/api/import/stock \
 
 | Метод | URL | Описание |
 |---|---|---|
-| `GET` | `/` | HTML дашборд |
+| `GET` | `/login` | Страница входа |
+| `POST` | `/login` | Проверка логина/пароля, установка сессии |
+| `POST` | `/logout` | Выход из системы |
+| `GET` | `/` | HTML дашборд (требует авторизации) |
 | `GET` | `/api/status` | Статус системы: счётчики, текущая сессия |
+| `GET` | `/api/settings` | Получить год планирования |
+| `POST` | `/api/settings` | Сохранить год планирования |
 | `POST` | `/api/allocate` | Запустить распределение (фоновая задача) |
-| `POST` | `/api/import/requirements` | Импорт потребностей (+ полный сброс БД) |
+| `POST` | `/api/import/works` | Импорт плановых работ (+ полный сброс БД) |
 | `POST` | `/api/import/emergency` | Импорт аварийных работ |
+| `POST` | `/api/import/requirements` | Импорт потребностей плановых работ |
+| `POST` | `/api/import/emergency-requirements` | Импорт потребностей аварийных работ |
 | `POST` | `/api/import/stock` | Импорт остатков склада |
 | `POST` | `/api/import/supplies` | Импорт поставок |
 | `POST` | `/api/import/writeoffs` | Импорт списаний |
 | `POST` | `/api/import/issued` | Импорт выдано не списано |
 | `POST` | `/api/import/transfers` | Загрузить согласованные перемещения (Слой 3в) |
-| `GET` | `/api/export/{session_id}` | Скачать Excel-отчёт текущей сессии |
+| `GET` | `/api/export/{session_id}` | Скачать Excel-отчёт сессии |
 | `GET` | `/api/ai/deficits/{session_id}` | Список материалов с дефицитом |
 | `POST` | `/api/ai/explain` | AI-объяснение причины дефицита |
 | `GET` | `/docs` | Swagger UI |
-| `GET` | `/redoc` | ReDoc |
 
 ### Примеры curl
 
@@ -553,6 +573,7 @@ http://localhost:8000/api/export/20260523_184619_66b95
 | `write_offs` | Фактические списания на работы (Слой 1) |
 | `issued_not_written_offs` | Выдано не списано (Слой 2) |
 | `approved_transfers` | Согласованные межфилиальные перемещения (Слой 3в) |
+| `system_settings` | Системные настройки: год планирования (id=1 всегда) |
 | `allocation_sessions` | Сессии запуска алгоритма (id, статус, время) |
 | `allocation_results` | Результаты распределения по слоям |
 | `deficit_records` | Записи о дефиците (Слой 5) |
@@ -564,8 +585,9 @@ http://localhost:8000/api/export/20260523_184619_66b95
 **`allocation_results.istochnik`** — источник покрытия:
 - `"spisanie"` — Слой 1: фактические списания
 - `"vydano"` — Слой 2: выдано не списано
-- `"sklad"` — Слой 3: со склада
-- `"odobren_perenos"` — Слой 3в: согласованное перемещение (реальное распределение, `is_possible=False`)
+- `"sklad"` — Слой 3: со склада своего филиала
+- `"vozmozhnoe_sklad"` — Слой 3б: потенциальное покрытие с другого филиала (`is_possible=True`)
+- `"odobren_perenos"` — Слой 3в: согласованное перемещение (`is_possible=False`)
 - `"postavka"` — Слой 4: из поставки
 
 **`allocation_results.is_possible`** — если `True`, это аналитическая запись (возможное межфилиальное покрытие), реальные остатки НЕ изменялись.
@@ -744,20 +766,25 @@ curl http://localhost:8000/api/status
 
 ---
 
-### Шаг 6 — Открыть Cloudflare Quick Tunnel
+### Шаг 6 — Cloudflare туннель (для доступа из браузера)
+
+На сервере уже настроен systemd-сервис `cloudflared-maps`, который запускается автоматически.
 
 ```bash
-# Фоновый режим: туннель работает даже при закрытом терминале*
-bash deploy/tunnel.sh --bg
+# Проверить статус туннеля
+sudo systemctl status cloudflared-maps
 
-# Получить публичный URL
-cat /tmp/maps_tunnel.url
-# → https://xxxx.trycloudflare.com
+# Получить текущий публичный URL
+sudo journalctl -u cloudflared-maps --no-pager | grep trycloudflare.com | tail -1
 ```
 
-Откройте ссылку в браузере — должен загрузиться дашборд MAPS.
+Или используйте прямой доступ по IP (работает без туннеля):
+```
+http://132.145.232.46:8000
+```
 
-> *При закрытии Cloud Shell сессии туннель всё равно остановится. Чтобы туннель работал постоянно — добавьте его в systemd (см. ниже).
+> URL туннеля меняется при каждом перезапуске сервиса — это особенность бесплатного
+> trycloudflare. Для постоянного URL нужен именованный Cloudflare Tunnel (платный аккаунт).
 
 ---
 
@@ -824,37 +851,22 @@ kill $(cat /tmp/cloudflared.pid)
 
 ---
 
-### Постоянный туннель через systemd (опционально)
+### Управление Cloudflare туннелем
 
-Чтобы туннель запускался автоматически вместе с сервером:
+Systemd-сервис `cloudflared-maps` уже установлен через `setup.sh`:
 
 ```bash
-# Создать systemd-сервис для туннеля
-sudo tee /etc/systemd/system/maps-tunnel.service > /dev/null <<EOF
-[Unit]
-Description=MAPS Cloudflare Tunnel
-After=maps.service
-Requires=maps.service
+# Запустить
+sudo systemctl start cloudflared-maps
 
-[Service]
-Type=simple
-User=ubuntu
-ExecStart=/usr/local/bin/cloudflared tunnel --url http://localhost:8000 --no-autoupdate
-Restart=on-failure
-RestartSec=10s
-StandardOutput=journal
-StandardError=journal
+# Остановить
+sudo systemctl stop cloudflared-maps
 
-[Install]
-WantedBy=multi-user.target
-EOF
+# Перезапустить (получить новый URL)
+sudo systemctl restart cloudflared-maps
 
-sudo systemctl daemon-reload
-sudo systemctl enable maps-tunnel
-sudo systemctl start maps-tunnel
-
-# Посмотреть URL в логах
-sudo journalctl -u maps-tunnel -n 20 | grep trycloudflare
+# Посмотреть текущий URL
+sudo journalctl -u cloudflared-maps --no-pager | grep trycloudflare.com | tail -1
 ```
 
 ---
@@ -915,14 +927,20 @@ nano .env
 - [x] Загрузка файлов через веб-форму с мгновенной статистикой
 - [x] Временные ссылки для скачивания отчётов
 
-### ✅ Этап 3 — Деплой и AI (выполнено)
-- [x] Деплой на Oracle Cloud (setup.sh + systemd-сервис)
-- [x] Cloudflare Quick Tunnel без домена и регистрации
+### ✅ Этап 3 — Деплой, AI и зрелость (выполнено)
+- [x] Деплой на Oracle Cloud (setup.sh + systemd-сервис `maps.service`)
+- [x] Cloudflare туннель как systemd-сервис `cloudflared-maps` (автозапуск)
+- [x] Прямой доступ по IP без туннеля (порт 8000 открыт)
 - [x] AI-анализ причин дефицита (Claude Sonnet)
 - [x] Согласованные межфилиальные перемещения (Слой 3в) с повторным распределением
+- [x] Аутентификация дашборда (логин/пароль, сессии 24ч)
+- [x] Год планирования: настройка через UI и API (`/api/settings`)
+- [x] Руководство пользователя с блок-схемами (PDF)
 
 ### 🔄 Этап 4 — Расширение (следующий)
 - [ ] CI/CD через GitHub Actions (тесты при каждом push)
+- [ ] Деплой на корпоративный сервер
+- [ ] Именованный Cloudflare Tunnel (постоянный URL)
 - [ ] Фильтрация распределения по конкретному филиалу/заводу
 - [ ] Сценарное моделирование (именованные версии распределения)
 - [ ] Расширенный аудит (кто запустил, какие файлы загрузил)
