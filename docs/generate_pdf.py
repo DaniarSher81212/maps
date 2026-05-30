@@ -12,7 +12,7 @@ from reportlab.lib.units import mm
 from reportlab.lib import colors
 from reportlab.platypus import (
     SimpleDocTemplate, Paragraph, Spacer, Preformatted,
-    HRFlowable, Table, TableStyle, KeepTogether
+    HRFlowable, Table, TableStyle, KeepTogether, Image
 )
 from reportlab.pdfbase import pdfmetrics
 from reportlab.pdfbase.ttfonts import TTFont
@@ -115,7 +115,7 @@ def parse_table(lines: list[str]) -> Table | None:
     return t
 
 
-def md_to_flowables(md_text: str) -> list:
+def md_to_flowables(md_text: str, base_dir: Path | None = None) -> list:
     """Преобразует Markdown в список объектов ReportLab (flowables)."""
     flowables = []
     lines = md_text.splitlines()
@@ -150,6 +150,22 @@ def md_to_flowables(md_text: str) -> list:
                 flowables.append(Spacer(1, 4))
                 flowables.append(tbl)
                 flowables.append(Spacer(1, 6))
+            continue
+
+        # ── Изображение ![alt](path) ─────────────────────────────────────────
+        m = re.match(r'^!\[([^\]]*)\]\(([^)]+)\)\s*$', line)
+        if m:
+            img_path_str = m.group(2)
+            img_path = (base_dir / img_path_str) if base_dir else Path(img_path_str)
+            if img_path.exists():
+                max_w = A4[0] - 40 * mm
+                tmp = Image(str(img_path))
+                ratio = tmp.imageHeight / tmp.imageWidth
+                img = Image(str(img_path), width=max_w, height=max_w * ratio)
+                flowables.append(Spacer(1, 6))
+                flowables.append(img)
+                flowables.append(Spacer(1, 6))
+            i += 1
             continue
 
         # ── Горизонтальная черта ──────────────────────────────────────────────
@@ -235,7 +251,7 @@ def build_pdf(md_path: Path, out_path: Path) -> None:
         title=md_path.stem,
     )
 
-    flowables = md_to_flowables(md_text)
+    flowables = md_to_flowables(md_text, base_dir=md_path.parent)
     doc.build(flowables)
     size_kb = out_path.stat().st_size // 1024
     print(f"  ✓  {out_path}  ({size_kb} KB)")
@@ -246,9 +262,10 @@ if __name__ == "__main__":
     root_dir = docs_dir.parent
 
     files = {
-        root_dir / "README.md":              docs_dir / "README.pdf",
-        docs_dir / "ИНСТРУКЦИЯ.md":          docs_dir / "ИНСТРУКЦИЯ.pdf",
-        docs_dir / "ТЗ_ПРЕЗЕНТАЦИЯ.md":      docs_dir / "ТЗ_ПРЕЗЕНТАЦИЯ.pdf",
+        root_dir / "README.md":                        docs_dir / "README.pdf",
+        docs_dir / "ИНСТРУКЦИЯ.md":                    docs_dir / "ИНСТРУКЦИЯ.pdf",
+        docs_dir / "ТЗ_ПРЕЗЕНТАЦИЯ.md":                docs_dir / "ТЗ_ПРЕЗЕНТАЦИЯ.pdf",
+        docs_dir / "РУКОВОДСТВО_ПОЛЬЗОВАТЕЛЯ.md":      docs_dir / "РУКОВОДСТВО_ПОЛЬЗОВАТЕЛЯ.pdf",
     }
 
     print("Генерация PDF-документации MAPS\n")
