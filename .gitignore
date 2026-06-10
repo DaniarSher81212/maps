@@ -22,12 +22,15 @@ env/
 .env.*.local
 
 # --- Файлы Python ---
-__pycache__/          # Скомпилированные .pyc файлы (кэш интерпретатора)
-*.pyc                 # Байт-код Python
+# Скомпилированные .pyc файлы (кэш интерпретатора)
+__pycache__/
+*.pyc
 *.pyo
 *.pyd
-*.egg-info/           # Метаданные установленного пакета (генерируется при pip install -e .)
-dist/                 # Собранный дистрибутив
+# Метаданные установленного пакета (генерируется при pip install -e .)
+*.egg-info/
+# Собранный дистрибутив
+dist/
 build/
 
 # --- Логи ---
@@ -38,15 +41,13 @@ logs/*.txt
 
 # --- Данные ---
 # Excel-файлы с реальными данными не коммитим (могут содержать конфиденциальное)
-data/*.xlsx
-data/*.xls
-data/*.csv
+data/**/*.xlsx
+data/**/*.xls
+data/**/*.csv
 # Результаты экспорта (генерируются при работе)
 data/exports/
 # Тестовые Excel-файлы (генерируются скриптом generate_test_scenarios.py)
 data/test/
-# Шаблоны Excel (пустые) — коммитим
-!data/templates/*.xlsx
 
 # --- Результаты тестов и покрытие ---
 .pytest_cache/
@@ -55,9 +56,9 @@ coverage.xml
 htmlcov/
 
 # --- IDE ---
-.idea/          # PyCharm
-.vscode/        # VS Code
-*.swp           # Vim
+.idea/
+.vscode/
+*.swp
 
 # --- БД ---
 *.db

@@ -90,7 +90,6 @@ from app.models.schemas import (
 from app.repositories.material_repository import (
     ApprovedTransferRepository,
     MaterialRepository,
-    StockBatchRepository,
 )
 from app.repositories.work_repository import RequirementRepository, WorkRepository
 
