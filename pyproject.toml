@@ -20,7 +20,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "maps"
-version = "0.1.0"
+version = "3.0.0"
 description = "Material Allocation & Planning System — система распределения материалов для строительно-монтажных работ"
 readme = "README.md"
 requires-python = ">=3.11"
