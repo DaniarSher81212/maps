@@ -1,6 +1,39 @@
-# Деплой MAPS на Oracle Cloud
+# Деплой MAPS на сервер
 
-## Что понадобится
+## Быстрая установка на любой корпоративный сервер
+
+```bash
+git clone https://github.com/DaniarSher81212/maps.git
+cd maps
+sudo bash deploy/server_install.sh
+```
+
+Скрипт сам установит Docker, поднимет PostgreSQL и MAPS, настроит автозапуск.
+В конце выведет адрес и пароль.
+
+**Тихая установка (для автоматизации, без вопросов):**
+```bash
+sudo bash deploy/server_install.sh --port 8000 --password МойПароль --nginx --silent
+```
+
+> Полное руководство по всем вариантам развёртывания: `docs/РАЗВЕРТЫВАНИЕ.md`
+
+---
+
+## Файлы в этой папке
+
+| Файл | Назначение |
+|---|---|
+| `server_install.sh` | ✅ Универсальная установка на корпоративный сервер (Ubuntu/Debian/RHEL) |
+| `setup.sh` | Установка на Oracle Cloud Ubuntu (без Docker, через systemd напрямую) |
+| `maps.service` | systemd-юнит (используется скриптом setup.sh) |
+| `tunnel.sh` | Cloudflare Quick Tunnel для временного публичного доступа |
+
+---
+
+## Установка на Oracle Cloud (старый способ — без Docker)
+
+### Что понадобится
 
 - Oracle Cloud VM (Ubuntu 22.04) — уже создан
 - SSH-доступ к серверу
