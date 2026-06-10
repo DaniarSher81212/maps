@@ -574,7 +574,14 @@ async function runAllocation() {
     document.getElementById("allocate-status").classList.remove("d-none");
 
     try {
-        await fetch("/api/allocate", { method: "POST" });
+        const resp = await fetch("/api/allocate", { method: "POST" });
+        if (resp.status === 409) {
+            // Расчёт уже идёт у другого пользователя — восстанавливаем UI
+            btn.disabled = false;
+            document.getElementById("allocate-status").classList.add("d-none");
+            alert("Расчёт уже выполняется. Дождитесь завершения текущего запуска.");
+            return;
+        }
         // Сразу опрашиваем — сессия уже создана в БД
         loadStatus();
     } catch(e) {
@@ -755,5 +762,9 @@ function statusBadge(status) {
     return `<span class="badge bg-${color} text-${color === 'warning' ? 'dark' : 'white'}">${label}</span>`;
 }
 </script>
+
+<footer class="text-center text-secondary small py-3 mt-4 border-top">
+    &copy; 2024&ndash;2026 Шералиев Даниар Ешалович. Все права защищены.
+</footer>
 </body>
 </html>
