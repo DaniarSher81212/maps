@@ -408,14 +408,14 @@ def _get_wide_allocation_df(session, session_id: str) -> pd.DataFrame:
     df["zakup_price"] = df["prognosnaya_tsena"].astype(float)
     df["zakup_summa"] = df["zakup_qty"] * df["zakup_price"]
 
+    # Обеспечённость считается строго по прогнозным ценам.
+    # covered_summa использует фактические цены склада/поставок, поэтому её
+    # нельзя делить на prognosnaya_stoimost (прогнозная цена). При одинаковых
+    # ценах формула сводится к raspredeleno / potrebnost — используем её напрямую.
     df["coverage_pct"] = df.apply(
         lambda row: (
-            round(row["covered_summa"] / row["prognosnaya_stoimost"] * 100, 1)
-            if row["prognosnaya_stoimost"] > 0
-            else (
-                round(row["raspredeleno"] / row["potrebnost"] * 100, 1)
-                if float(row["potrebnost"]) > 0 else 0.0
-            )
+            round(float(row["raspredeleno"]) / float(row["potrebnost"]) * 100, 1)
+            if float(row["potrebnost"]) > 0 else 0.0
         ),
         axis=1,
     )
@@ -712,8 +712,9 @@ def _get_coverage_by_work_df(session, session_id: str) -> pd.DataFrame:
             COUNT(r.id)                                         AS materials_count,
             COALESCE(SUM(r.potrebnost * r.prognosnaya_tsena), 0) AS stoimost_potrebnosti,
             COALESCE((
-                SELECT SUM(ar.summa)
+                SELECT SUM(ar.kolichestvo * r2.prognosnaya_tsena)
                 FROM allocation_results ar
+                JOIN requirements r2 ON ar.requirement_id = r2.id
                 WHERE ar.work_id = w.id
                   AND ar.session_id = :sid
                   AND ar.is_possible = FALSE
