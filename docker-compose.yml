@@ -1,0 +1,95 @@
+# =============================================================================
+# docker-compose.yml — запуск MAPS + PostgreSQL в контейнерах
+#
+# Использование:
+#   docker compose up -d          — запустить всё (MAPS + PostgreSQL)
+#   docker compose down           — остановить
+#   docker compose down -v        — остановить и удалить данные PostgreSQL
+#   docker compose logs -f maps   — логи MAPS
+#   docker compose logs -f postgres — логи PostgreSQL
+#
+# Переменные (можно задать в файле .env рядом с этим файлом):
+#   MAPS_PASSWORD — пароль базы данных (по умолчанию: ***REMOVED-DB-PASSWORD***)
+#   MAPS_PORT     — внешний порт для MAPS (по умолчанию: 8000)
+# =============================================================================
+
+services:
+
+  # ── PostgreSQL ──────────────────────────────────────────────────────────────
+  postgres:
+    image: postgres:15-alpine
+    container_name: maps_postgres
+    restart: unless-stopped
+
+    environment:
+      POSTGRES_DB: maps_db
+      POSTGRES_USER: maps_user
+      # Пароль по умолчанию — сменить через MAPS_PASSWORD в .env для production
+      POSTGRES_PASSWORD: ${MAPS_PASSWORD:-***REMOVED-PASSWORD***}
+      PGDATA: /var/lib/postgresql/data/pgdata
+
+    volumes:
+      # Данные хранятся на хосте — не пропадут при пересоздании контейнера
+      - postgres_data:/var/lib/postgresql/data
+
+    healthcheck:
+      # Ждём пока PostgreSQL готов принимать подключения
+      test: ["CMD-SHELL", "pg_isready -U maps_user -d maps_db"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+    # PostgreSQL не выставляем наружу — только MAPS общается с ним внутри
+    # Раскомментируйте если нужен прямой доступ к БД (для DBA/отладки):
+    # ports:
+    #   - "5432:5432"
+
+  # ── MAPS ────────────────────────────────────────────────────────────────────
+  maps:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: maps_app
+    restart: unless-stopped
+
+    depends_on:
+      postgres:
+        # Ждём пока PostgreSQL пройдёт healthcheck (принимает подключения)
+        condition: service_healthy
+
+    environment:
+      DB_HOST: postgres         # Имя сервиса postgres из этого файла
+      DB_PORT: "5432"
+      DB_NAME: maps_db
+      DB_USER: maps_user
+      DB_PASSWORD: ${MAPS_PASSWORD:-***REMOVED-PASSWORD***}
+      APP_ENV: production
+      LOG_LEVEL: INFO
+      SESSION_PREFIX: session
+      DATA_DIR: /app/data
+      EXPORT_DIR: /app/data/exports
+      MAPS_USERNAME: ${MAPS_USERNAME:-admin}
+      MAPS_PASSWORD: ${MAPS_PASSWORD:-***REMOVED-PASSWORD***}
+      # Добавьте ключ Anthropic API для AI-функций:
+      # ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY}
+
+    ports:
+      # MAPS_PORT:8000 — можно изменить внешний порт через .env
+      - "${MAPS_PORT:-8000}:8000"
+
+    volumes:
+      # Данные и экспорты сохраняются между перезапусками
+      - maps_data:/app/data
+
+    # Применяем миграции Alembic при каждом старте контейнера,
+    # затем запускаем uvicorn
+    command: >
+      sh -c "alembic upgrade head && uvicorn app.api.main:app
+             --host 0.0.0.0 --port 8000 --log-level info"
+
+# ── Именованные тома ──────────────────────────────────────────────────────────
+volumes:
+  postgres_data:
+    # Данные PostgreSQL — хранятся в /var/lib/docker/volumes/
+  maps_data:
+    # Загруженные файлы и экспорты MAPS
