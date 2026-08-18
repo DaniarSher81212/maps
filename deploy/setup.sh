@@ -80,7 +80,7 @@ systemctl enable postgresql
 
 # Создаём пользователя и базу данных
 # -c: выполнить SQL-команду; || true: не падать если уже существует
-sudo -u postgres psql -c "CREATE USER maps_user WITH PASSWORD '***REMOVED-DB-PASSWORD***';" 2>/dev/null || warn "Пользователь maps_user уже существует"
+sudo -u postgres psql -c "CREATE USER maps_user WITH PASSWORD 'CHANGE_ME_DB_PASSWORD';" 2>/dev/null || warn "Пользователь maps_user уже существует"
 sudo -u postgres psql -c "CREATE DATABASE maps_db OWNER maps_user;" 2>/dev/null || warn "База maps_db уже существует"
 sudo -u postgres psql -c "GRANT ALL PRIVILEGES ON DATABASE maps_db TO maps_user;" 2>/dev/null
 
@@ -122,7 +122,7 @@ DB_HOST=localhost
 DB_PORT=5432
 DB_NAME=maps_db
 DB_USER=maps_user
-DB_PASSWORD=***REMOVED-DB-PASSWORD***
+DB_PASSWORD=CHANGE_ME_DB_PASSWORD
 
 # --- Приложение ---
 APP_ENV=production

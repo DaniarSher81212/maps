@@ -66,7 +66,7 @@ show_result() {
     echo -e "  ${BLUE}http://localhost:${port}${NC}"
     echo ""
     echo -e "  Логин:  ${YELLOW}admin${NC}"
-    echo -e "  Пароль: ${YELLOW}***REMOVED-PASSWORD***${NC}  (сменить в .env: MAPS_PASSWORD=...)"
+    echo -e "  Пароль: ${YELLOW}CHANGE_ME${NC}  (сменить в .env: MAPS_PASSWORD=...)"
     echo ""
     echo -e "  Остановить:  ${YELLOW}bash start.sh stop${NC}"
     echo -e "  Логи:        ${YELLOW}bash start.sh logs${NC}"

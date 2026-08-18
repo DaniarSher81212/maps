@@ -86,7 +86,7 @@ sudo -u postgres psql -c "ALTER USER maps_user PASSWORD 'ВАШ_НАДЁЖНЫЙ
 
 # То же самое в .env:
 nano ~/maps/.env
-# Найдите строку DB_PASSWORD=***REMOVED-DB-PASSWORD*** и замените
+# Найдите строку DB_PASSWORD=CHANGE_ME_DB_PASSWORD и замените
 ```
 
 ---

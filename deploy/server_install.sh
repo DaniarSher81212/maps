@@ -13,7 +13,7 @@
 #
 # Флаги:
 #   --port    PORT      Порт для MAPS (по умолчанию: 8000)
-#   --password PASS     Пароль входа в систему (по умолчанию: ***REMOVED-PASSWORD***)
+#   --password PASS     Пароль входа в систему (по умолчанию: CHANGE_ME)
 #   --nginx             Настроить Nginx как reverse proxy на порту 80
 #   --silent            Не задавать вопросов, использовать дефолты/флаги
 # =============================================================================
@@ -32,7 +32,7 @@ ask()  { echo -e "${BOLD}[?]${NC} $1"; }
 
 # ── Дефолтные значения ────────────────────────────────────────────────────────
 MAPS_PORT=8000
-MAPS_PASSWORD="***REMOVED-PASSWORD***"
+MAPS_PASSWORD="CHANGE_ME"
 MAPS_USERNAME="admin"
 SETUP_NGINX=false
 SILENT=false

@@ -58,7 +58,7 @@ class Settings(BaseSettings):
     secret_key: str = Field(default="change-me-in-production", description="Секрет для сессий")
     # Логин и пароль для входа в дашборд
     maps_username: str = Field(default="admin", description="Логин дашборда")
-    maps_password: str = Field(default="***REMOVED-PASSWORD***", description="Пароль дашборда")
+    maps_password: str = Field(default="CHANGE_ME", description="Пароль дашборда")
 
     # --- AI-анализ ---
     # Ключ Anthropic API для функции объяснения дефицита.

@@ -8,8 +8,8 @@
 #   docker compose logs -f maps   — логи MAPS
 #   docker compose logs -f postgres — логи PostgreSQL
 #
-# Переменные (можно задать в файле .env рядом с этим файлом):
-#   MAPS_PASSWORD — пароль базы данных (по умолчанию: ***REMOVED-DB-PASSWORD***)
+# Переменные (задаются в файле .env рядом с этим файлом):
+#   MAPS_PASSWORD — пароль базы данных (обязательна, дефолта нет)
 #   MAPS_PORT     — внешний порт для MAPS (по умолчанию: 8000)
 # =============================================================================
 
@@ -24,8 +24,8 @@ services:
     environment:
       POSTGRES_DB: maps_db
       POSTGRES_USER: maps_user
-      # Пароль по умолчанию — сменить через MAPS_PASSWORD в .env для production
-      POSTGRES_PASSWORD: ${MAPS_PASSWORD:-***REMOVED-PASSWORD***}
+      # Обязателен — без него docker compose откажется стартовать
+      POSTGRES_PASSWORD: ${MAPS_PASSWORD:?Задайте MAPS_PASSWORD в .env, см. .env.example}
       PGDATA: /var/lib/postgresql/data/pgdata
 
     volumes:
@@ -62,14 +62,14 @@ services:
       DB_PORT: "5432"
       DB_NAME: maps_db
       DB_USER: maps_user
-      DB_PASSWORD: ${MAPS_PASSWORD:-***REMOVED-PASSWORD***}
+      DB_PASSWORD: ${MAPS_PASSWORD:?Задайте MAPS_PASSWORD в .env, см. .env.example}
       APP_ENV: production
       LOG_LEVEL: INFO
       SESSION_PREFIX: session
       DATA_DIR: /app/data
       EXPORT_DIR: /app/data/exports
       MAPS_USERNAME: ${MAPS_USERNAME:-admin}
-      MAPS_PASSWORD: ${MAPS_PASSWORD:-***REMOVED-PASSWORD***}
+      MAPS_PASSWORD: ${MAPS_PASSWORD:?Задайте MAPS_PASSWORD в .env, см. .env.example}
       # Добавьте ключ Anthropic API для AI-функций:
       # ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY}
 
